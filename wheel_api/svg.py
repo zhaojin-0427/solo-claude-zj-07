@@ -28,7 +28,7 @@ def _pt(cx, cy, radius, ang):
     return cx + radius * math.cos(ang), cy - radius * math.sin(ang)
 
 
-def _panel(spec, entries, geometry, side: str, cx: float, cy: float) -> str:
+def _panel(spec, entries, geometry, side: str, cx: float, cy: float, first_rim_hole: int) -> str:
     n_total = spec.rim.holes
     n_side = n_total // 2
     rim_r = spec.rim.erd_mm / 2.0
@@ -41,7 +41,7 @@ def _panel(spec, entries, geometry, side: str, cx: float, cy: float) -> str:
     parts.append(f'<circle cx="{cx}" cy="{cy}" r="{RIM_PX}" fill="none" stroke="{COLORS["rim"]}" stroke-width="3"/>')
     parts.append(f'<circle cx="{cx}" cy="{cy}" r="{hub_px:.1f}" fill="none" stroke="{COLORS["hub"]}" stroke-width="1.5"/>')
 
-    # 辐条（首根 = 0 号圈孔，仅在其所属面板加粗）
+    # 辐条（首根加粗，仅在其所属面板）
     for e in entries:
         if e["side"] != side:
             continue
@@ -51,7 +51,7 @@ def _panel(spec, entries, geometry, side: str, cx: float, cy: float) -> str:
         x2, y2 = _pt(cx, cy, RIM_PX, a_r)
         color = COLORS[e["direction"]]
         dash = ' stroke-dasharray="5 3"' if e["insertion"] == "heads_in" else ""
-        width = 2.4 if e["rim_hole"] == 0 else 1.2
+        width = 2.4 if e["rim_hole"] == first_rim_hole else 1.2
         parts.append(
             f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
             f'stroke="{color}" stroke-width="{width}" opacity="0.85"{dash}/>'
@@ -82,9 +82,9 @@ def _panel(spec, entries, geometry, side: str, cx: float, cy: float) -> str:
     lx, ly = _pt(cx, cy, RIM_PX + 26, v_ang)
     parts.append(f'<text x="{lx:.1f}" y="{ly:.1f}" class="valve" text-anchor="middle">VALVE</text>')
 
-    # 首根辐条标记（0 号圈孔在右侧面板）
-    if any(e["rim_hole"] == 0 for e in entries):
-        a0 = rim_angle(0, n_total)
+    # 首根辐条标记（紧邻阀孔的圈孔，仅在其所属面板）
+    if any(e["rim_hole"] == first_rim_hole for e in entries):
+        a0 = rim_angle(first_rim_hole, n_total)
         fx, fy = _pt(cx, cy, RIM_PX - 14, a0)
         parts.append(f'<circle cx="{fx:.1f}" cy="{fy:.1f}" r="4" fill="{COLORS["first"]}"/>')
 
@@ -94,7 +94,7 @@ def _panel(spec, entries, geometry, side: str, cx: float, cy: float) -> str:
     return "\n".join(parts)
 
 
-def render_svg(spec, entries: list[dict], geometry: dict) -> str:
+def render_svg(spec, entries: list[dict], geometry: dict, first_rim_hole: int = 0) -> str:
     width = PANEL_W * 2
     cx1, cx2, cy = PANEL_W / 2, PANEL_W * 1.5, HEIGHT / 2 + 10
     left_entries = [e for e in entries if e["side"] == "left"]
@@ -110,8 +110,8 @@ def render_svg(spec, entries: list[dict], geometry: dict) -> str:
   .legend {{ font-size: 10px; }}
 </style>
 <rect width="100%" height="100%" fill="white"/>
-{_panel(spec, right_entries, geometry, "right", cx1, cy)}
-{_panel(spec, left_entries, geometry, "left", cx2, cy)}
+{_panel(spec, right_entries, geometry, "right", cx1, cy, first_rim_hole)}
+{_panel(spec, left_entries, geometry, "left", cx2, cy, first_rim_hole)}
 <g class="legend">
   <line x1="20" y1="{legend_y}" x2="50" y2="{legend_y}" stroke="{COLORS["trailing"]}" stroke-width="2"/>
   <text x="56" y="{legend_y + 3}">trailing</text>

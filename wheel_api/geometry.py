@@ -11,7 +11,7 @@ import math
 
 from .errors import WheelError
 
-FORMULA_VERSION = "wheel-geometry/1.0"
+FORMULA_VERSION = "wheel-geometry/1.1"
 
 # 随版本快照一起保存的计算公式（文本形式，便于追溯）
 FORMULAS = {
@@ -23,8 +23,9 @@ FORMULAS = {
     "tension_ratio": "T_left / T_right = sin(bracing_right) / sin(bracing_left)（横向力平衡）",
     "rim_entry_angle": "入圈角 = 辐条方向与圈孔处半径方向的夹角（0 = 正对轴心）",
     "flange_exit_angle": "出线角 = 辐条在轮平面投影与法兰孔处切线的夹角（0 = 相切，90 = 径向）",
-    "washer_fit": "spoke_length = ideal + washer_t +/- err; |err| <= length_tolerance",
-    "thread_engagement": "engagement = spoke_thread_length + min(0, err) >= min_thread_engagement; err <= max_protrusion",
+    "washer_fit": "err_hole = spoke_length - washer_t - ideal_hole（逐孔判定）；max|err_hole| <= length_tolerance",
+    "thread_engagement": "engagement = spoke_thread_length + min(0, min err_hole) >= min_thread_engagement; max err_hole <= max_protrusion",
+    "inventory_merge": "同一长度的多行库存数量累加后，与两侧各 n 根的需求量比较",
 }
 
 

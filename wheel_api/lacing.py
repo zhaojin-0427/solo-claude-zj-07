@@ -159,26 +159,30 @@ def _entries_from_override(spec, n_side: int) -> list[dict]:
     return entries
 
 
-def _build_sequence(entries: list[dict]) -> list[dict]:
-    """编轮次序：右侧内穿组 -> 右侧外穿组 -> 左侧内穿组 -> 左侧外穿组，组内按圈孔号。"""
+def _build_sequence(entries: list[dict], first_rim_hole: int, n_total: int) -> list[dict]:
+    """编轮次序：含首根的组最先，其余按 内穿组 -> 外穿组、首根侧 -> 另一侧；
+    组内从紧邻阀孔的圈孔开始按旋转顺序排列，保证第 1 步即首根辐条。"""
+    first_entry = next(e for e in entries if e["rim_hole"] == first_rim_hole)
+    first_side = first_entry["side"]
+    other_side = "left" if first_side == "right" else "right"
+    groups = [(s, ins) for s in (first_side, other_side) for ins in ("heads_in", "heads_out")]
+    first_group = (first_entry["side"], first_entry["insertion"])
+    groups.sort(key=lambda g: 0 if g == first_group else 1)  # 稳定排序，首根所在组提到最前
     seq = []
     step = 0
-    for side in ("right", "left"):
-        for insertion in ("heads_in", "heads_out"):
-            group = sorted(
-                (e for e in entries if e["side"] == side and e["insertion"] == insertion),
-                key=lambda e: e["rim_hole"],
-            )
-            for e in group:
-                step += 1
-                seq.append({
-                    "step": step,
-                    "side": side,
-                    "insertion": insertion,
-                    "direction": e["direction"],
-                    "rim_hole": e["rim_hole"],
-                    "hub_hole": e["hub_hole"],
-                })
+    for side, insertion in groups:
+        group = [e for e in entries if e["side"] == side and e["insertion"] == insertion]
+        group.sort(key=lambda e: (e["rim_hole"] - first_rim_hole) % n_total)
+        for e in group:
+            step += 1
+            seq.append({
+                "step": step,
+                "side": side,
+                "insertion": insertion,
+                "direction": e["direction"],
+                "rim_hole": e["rim_hole"],
+                "hub_hole": e["hub_hole"],
+            })
     return seq
 
 
@@ -204,7 +208,9 @@ def build_mapping(spec) -> dict:
         _check_bijection(entries, n_side, n_total)
 
     entries.sort(key=lambda e: e["rim_hole"])
-    first = next(e for e in entries if e["rim_hole"] == 0)
+    # 首根 = 阀孔顺时针侧紧邻的圈孔（阀孔在 valve_position 与下一孔之间）
+    first_rim_hole = (spec.rim.valve_position + 1) % n_total
+    first = next(e for e in entries if e["rim_hole"] == first_rim_hole)
     rim_r = spec.rim.erd_mm / 2.0
 
     return {
@@ -216,7 +222,7 @@ def build_mapping(spec) -> dict:
             "side": first["side"],
             "direction": first["direction"],
             "insertion": first["insertion"],
-            "note": "首根辐条取阀孔顺时针侧第 0 号圈孔，相位已按阀孔避让选取",
+            "note": f"首根辐条取阀孔顺时针侧第 {first_rim_hole} 号圈孔，相位已按阀孔避让选取",
         },
         "valve": {
             "position_between": [spec.rim.valve_position, (spec.rim.valve_position + 1) % n_total],
@@ -224,6 +230,6 @@ def build_mapping(spec) -> dict:
             "clearance_deg": r3(math.degrees(clearance / rim_r)),
         },
         "mapping": entries,
-        "sequence": _build_sequence(entries),
+        "sequence": _build_sequence(entries, first_rim_hole, n_total),
         "crossing_note": "外穿（heads-out）辐条在最外侧交叉处压过内穿（heads-in）辐条",
     }

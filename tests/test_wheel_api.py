@@ -248,9 +248,82 @@ def test_optimizer_tension_infeasible():
 def test_new_wheel_version_and_404():
     pid = client.post("/plans", json=SPEC).json()["plan_id"]
     spec2 = _spec(name="v2", left={"cross": 2, "heads_in": "leading"})
-    r = client.post(f"/plans/{pid}/versions", json=spec2)
+    r = client.post("/plans/{pid}/versions".format(pid=pid), json=spec2)
     assert r.status_code == 201
     assert r.json()["version"] == 2
     assert r.json()["inputs"]["left"]["cross"] == 2
     assert client.get("/plans/whl_nonexistent").status_code == 404
     assert client.get(f"/plans/{pid}/versions/99").status_code == 404
+
+
+def test_first_spoke_follows_valve():
+    # 阀孔移到 10 与 11 号圈孔之间：首根应落在 11 号孔，且编轮第 1 步即首根
+    spec = _spec(rim={**SPEC["rim"], "valve_position": 10})
+    r = client.post("/plans", json=spec)
+    assert r.status_code == 201, r.text
+    lac = r.json()["lacing"]
+    assert lac["valve"]["position_between"] == [10, 11]
+    assert lac["first_spoke"]["rim_hole"] == 11
+    assert lac["sequence"][0]["rim_hole"] == 11
+    assert [s["step"] for s in lac["sequence"]] == list(range(1, 37))
+    assert len({(s["side"], s["rim_hole"]) for s in lac["sequence"]}) == 36
+
+
+def test_optimizer_per_hole_tolerance():
+    pid = client.post("/plans", json=SPEC).json()["plan_id"]
+    g = client.get(f"/plans/{pid}").json()["geometry"]
+    tl = g["sides"]["left"]["spoke_length_mm"]
+    tr = g["sides"]["right"]["spoke_length_mm"]
+    opt = {
+        "inventory": [{"length_mm": tl}, {"length_mm": tr}],
+        "tension_min_n": 600.0,
+        "tension_max_n": 1400.0,
+        "length_tolerance_mm": 1.0,
+    }
+    r = client.post(f"/plans/{pid}/optimize", json=opt)
+    combos = r.json()["optimization"]["combos"]
+    assert combos
+    # 逐孔判定：内/外穿修正使各孔理想长度相对汇总值散布约 ±0.44mm
+    assert combos[0]["max_deviation_mm"] == pytest.approx(0.441, abs=0.02)
+    # 容差收紧到 0.01mm：逐孔最大偏差 0.441mm 超出容差，应全部排除
+    opt["length_tolerance_mm"] = 0.01
+    r2 = client.post(f"/plans/{pid}/optimize", json=opt)
+    res2 = r2.json()["optimization"]
+    assert res2["combos"] == []
+    assert res2["excluded"]["length_tolerance"] > 0
+
+
+def test_optimizer_merges_inventory_counts():
+    # 对称轮组：两侧理想长度一致，单一长度即可覆盖两侧 36 根
+    spec = _spec(
+        rim={"erd_mm": 600.0, "holes": 36, "valve_position": 35},
+        hub={
+            "holes_per_flange": 18,
+            "flange_pcd_left_mm": 50.0,
+            "flange_pcd_right_mm": 50.0,
+            "center_to_flange_left_mm": 30.0,
+            "center_to_flange_right_mm": 30.0,
+            "spoke_hole_diameter_mm": 2.4,
+        },
+        left={"cross": 3},
+        right={"cross": 3},
+    )
+    pid = client.post("/plans", json=spec).json()["plan_id"]
+    g = client.get(f"/plans/{pid}").json()["geometry"]
+    ideal = g["sides"]["right"]["spoke_length_mm"]
+    l0 = round(ideal)
+    opt = {
+        # 两行相同长度、各 18 根：合并后 36 根恰好满足
+        "inventory": [{"length_mm": l0, "count": 18}, {"length_mm": l0, "count": 18}],
+        "tension_min_n": 600.0,
+        "tension_max_n": 1400.0,
+        "length_tolerance_mm": 1.0,
+    }
+    r = client.post(f"/plans/{pid}/optimize", json=opt)
+    res = r.json()["optimization"]
+    assert res["feasible"] is True
+    assert res["combos"], "同长度分行库存合并后应凑足 36 根"
+    c = res["combos"][0]
+    assert c["left"]["spoke_length_mm"] == l0
+    assert c["right"]["spoke_length_mm"] == l0
+    assert c["spoke_spec_count"] == 1

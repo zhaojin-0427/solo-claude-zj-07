@@ -1,10 +1,14 @@
 """库存辐条 + 垫圈组合优化。
 
-装配关系：垫圈厚度 t 使条帽座外移，等效理想长度变为 ideal + t，
-故 偏差 err = 库存条长 - t - ideal。合格条件：
-  |err| <= length_tolerance（允许长度误差）
-  engagement = thread_length + min(0, err) >= min_thread_engagement（螺纹啮合）
-  err <= max_protrusion（条帽顶端外露）
+装配关系：垫圈厚度 t 使条帽座外移，等效理想长度变为 ideal + t。
+偏差按**逐孔**理想长度判定（同一侧内/外穿修正使各孔理想长度略有散布）：
+  err_hole = 库存条长 - t - ideal_hole
+合格条件（对该侧全部孔取最不利值）：
+  max|err_hole| <= length_tolerance（允许长度误差）
+  engagement = thread_length + min(0, min err_hole) >= min_thread_engagement（螺纹啮合）
+  max err_hole <= max_protrusion（条帽顶端外露）
+库存数量：同一长度的多行库存先合并（数量累加，任一行不限量则不限量），
+再与两侧需求量（各 n 根）比较。
 张力：T_left = ratio * T_right，两侧均须落在 [tension_min, tension_max]；
 在可行区间内取中点使张力余量最大。
 排序：最大长度偏差升序 -> 张力余量降序 -> 规格种数升序。
@@ -15,27 +19,44 @@ from __future__ import annotations
 from .geometry import r3
 
 
-def _side_candidates(target: float, washer_options: list[float], spec, excluded: dict) -> list[dict]:
-    cands = []
+def _merge_inventory(spec) -> list[tuple[float, "int | None"]]:
+    """按长度合并库存行：数量累加；任一行 count 为 None 则该长度不限量。"""
+    merged: dict[float, "int | None"] = {}
     for sp in spec.inventory:
+        length = float(sp.length_mm)
+        if length not in merged:
+            merged[length] = sp.count
+        elif merged[length] is not None:
+            merged[length] = None if sp.count is None else merged[length] + sp.count
+    return sorted(merged.items())
+
+
+def _side_candidates(inventory, ideals: list[float], washer_options: list[float],
+                     spec, excluded: dict) -> list[dict]:
+    """单侧候选：对每个（长度, 垫圈）按该侧全部孔的逐孔偏差判定。"""
+    cands = []
+    for length, count in inventory:
         for t in washer_options:
-            err = sp.length_mm - t - target
-            if abs(err) > spec.length_tolerance_mm + 1e-9:
+            errs = [length - t - ideal for ideal in ideals]
+            max_abs = max(abs(e) for e in errs)
+            if max_abs > spec.length_tolerance_mm + 1e-9:
                 excluded["length_tolerance"] += 1
                 continue
-            engagement = spec.spoke_thread_length_mm + min(0.0, err)
+            # 螺纹啮合按最不利（相对最短的孔）判定
+            engagement = spec.spoke_thread_length_mm + min(0.0, min(errs))
             if engagement < spec.min_thread_engagement_mm - 1e-9:
                 excluded["thread_engagement"] += 1
                 continue
-            if err > spec.max_protrusion_mm + 1e-9:
+            if max(errs) > spec.max_protrusion_mm + 1e-9:
                 excluded["protrusion"] += 1
                 continue
             cands.append({
-                "spoke_length_mm": r3(sp.length_mm),
+                "spoke_length_mm": r3(length),
                 "washer_mm": r3(t),
-                "deviation_mm": r3(err),
+                "deviation_mm": r3(max_abs),
+                "deviation_range_mm": [r3(min(errs)), r3(max(errs))],
                 "thread_engagement_mm": r3(engagement),
-                "_count": sp.count,
+                "_count": count,
             })
     return cands
 
@@ -43,9 +64,18 @@ def _side_candidates(target: float, washer_options: list[float], spec, excluded:
 def optimize(geometry: dict, spec) -> dict:
     n_side = geometry["holes_per_side"]
     ratio = geometry["tension_ratio_left_to_right"]
+    per_hole = geometry["per_hole"]
+    ideals = {
+        side: [h["length_mm"] for h in per_hole if h["side"] == side]
+        for side in ("left", "right")
+    }
     targets = {
-        "left": geometry["sides"]["left"]["spoke_length_mm"],
-        "right": geometry["sides"]["right"]["spoke_length_mm"],
+        side: {
+            "nominal_mm": geometry["sides"][side]["spoke_length_mm"],
+            "per_hole_min_mm": r3(min(ideals[side])),
+            "per_hole_max_mm": r3(max(ideals[side])),
+        }
+        for side in ("left", "right")
     }
 
     # 张力可行区间（对右侧张力求解）
@@ -54,7 +84,7 @@ def optimize(geometry: dict, spec) -> dict:
     hi = min(tmax, tmax / ratio)
     base = {
         "inputs": spec.model_dump(),
-        "targets": {"left_ideal_mm": targets["left"], "right_ideal_mm": targets["right"]},
+        "targets": targets,
         "tension_ratio_left_to_right": ratio,
     }
     if lo > hi + 1e-9:
@@ -76,19 +106,20 @@ def optimize(geometry: dict, spec) -> dict:
         "margin_n": r3(margin),
     }
 
+    inventory = _merge_inventory(spec)
     washer_options = sorted({0.0} | {float(w) for w in spec.washers_mm})
     excluded = {"length_tolerance": 0, "thread_engagement": 0, "protrusion": 0, "inventory_count": 0}
-    left_cands = _side_candidates(targets["left"], washer_options, spec, excluded)
-    right_cands = _side_candidates(targets["right"], washer_options, spec, excluded)
+    left_cands = _side_candidates(inventory, ideals["left"], washer_options, spec, excluded)
+    right_cands = _side_candidates(inventory, ideals["right"], washer_options, spec, excluded)
 
     combos = []
     for lc in left_cands:
         for rc in right_cands:
-            # 库存数量校验：同一长度在两侧共用时要累加需求
+            # 库存数量校验：同一长度在两侧共用时要累加需求（每侧 n 根）
             need = {}
-            for c, cnt in ((lc, n_side), (rc, n_side)):
+            for c in (lc, rc):
                 key = c["spoke_length_mm"]
-                need[key] = need.get(key, 0) + cnt
+                need[key] = need.get(key, 0) + n_side
             ok = True
             for c in (lc, rc):
                 if c["_count"] is not None and need[c["spoke_length_mm"]] > c["_count"]:
@@ -96,7 +127,7 @@ def optimize(geometry: dict, spec) -> dict:
             if not ok:
                 excluded["inventory_count"] += 1
                 continue
-            max_dev = max(abs(lc["deviation_mm"]), abs(rc["deviation_mm"]))
+            max_dev = max(lc["deviation_mm"], rc["deviation_mm"])
             specs = len({lc["spoke_length_mm"], rc["spoke_length_mm"]})
             combos.append({
                 "left": {k: v for k, v in lc.items() if not k.startswith("_")},

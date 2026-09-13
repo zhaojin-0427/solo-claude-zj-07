@@ -56,9 +56,11 @@ curl -X POST http://127.0.0.1:8000/plans -H 'Content-Type: application/json' -d 
 - `geometry.sides`：每侧名义辐条长度（含内/外穿修正）、交叉角、有效法兰偏距、张角；
 - `geometry.per_hole`：**逐孔**辐条长度、入圈角、法兰出线角、张角；
 - `geometry.tension_ratio_left_to_right`：左右张力比；
-- `lacing.first_spoke`：避开阀孔的首根定位（相位自动二选一，取阀孔净空更大者）；
+- `lacing.first_spoke`：避开阀孔的首根定位——取阀孔顺时针侧紧邻的圈孔
+  （`valve_position + 1`），相位自动二选一使阀孔净空最大；
 - `lacing.valve`：阀孔位置与到最近辐条的净空；
-- `lacing.sequence`：编轮次序（右内穿组 → 右外穿组 → 左内穿组 → 左外穿组，组内按圈孔号）；
+- `lacing.sequence`：编轮次序（首根所在组为第 1 步，其余按 内穿组 → 外穿组、
+  首根侧 → 另一侧，组内从紧邻阀孔的圈孔起按旋转顺序排列）；
 - `lacing.mapping`：完整孔位映射；
 - `svg`：左右双视图 SVG 穿线图（标注孔号、阀孔、首根、顺/逆向与内/外穿）；
 - `formulas` / `formula_version`：本版本使用的全部计算公式。
@@ -75,19 +77,22 @@ curl -X POST http://127.0.0.1:8000/plans/whl_xxx/optimize -H 'Content-Type: appl
 }'
 ```
 
-装配关系：垫圈厚度 `t` 使条帽座外移，等效理想长度变为 `ideal + t`，
-故 `偏差 err = 库存条长 − t − ideal`。合格条件：
+装配关系：垫圈厚度 `t` 使条帽座外移，等效理想长度变为 `ideal + t`。
+偏差按**逐孔**理想长度判定（同侧内/外穿修正使各孔理想长度存在散布）：
+`err_hole = 库存条长 − t − ideal_hole`。合格条件（对该侧全部孔取最不利值）：
 
-- `|err| ≤ length_tolerance_mm`（允许长度误差）；
-- `螺纹啮合 = spoke_thread_length + min(0, err) ≥ min_thread_engagement_mm`；
-- `err ≤ max_protrusion_mm`（条帽顶端外露）；
+- `max|err_hole| ≤ length_tolerance_mm`（允许长度误差，按逐孔最大偏差判定与报告）；
+- `螺纹啮合 = spoke_thread_length + min(0, min err_hole) ≥ min_thread_engagement_mm`；
+- `max err_hole ≤ max_protrusion_mm`（条帽顶端外露）；
 - 张力：`T_left = ratio × T_right`，两侧均须落在张力上下限内（在可行区间取中点使余量最大）；
-- 提供库存数量时，同一长度两侧共用需累加校验。
+- 库存数量：同一长度的多行库存先合并（数量累加，任一行不限量则该长度不限量），
+  再与两侧各 n 根的需求量比较。
 
 组合按 **最大长度偏差升序 → 张力余量降序 → 规格种数升序** 排序，
-`excluded` 中给出各原因被淘汰的候选数。
+`excluded` 中给出各原因被淘汰的候选数；每个组合附带
+`deviation_range_mm`（该侧逐孔偏差区间）供核查。
 
-## 计算公式（formula_version: wheel-geometry/1.0）
+## 计算公式（formula_version: wheel-geometry/1.1）
 
 ```
 L      = sqrt(R² + r_eff² + w_eff² − 2·R·r_eff·cos δ) − s/2

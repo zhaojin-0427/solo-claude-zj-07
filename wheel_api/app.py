@@ -41,7 +41,7 @@ def _now() -> str:
 def _build_snapshot(spec: WheelSpec, plan_id: str, version: int, created_at: str) -> dict:
     mapping = lacing.build_mapping(spec)
     geo = geometry.compute_geometry(spec, mapping["mapping"], spec.rim.holes // 2)
-    svg_text = svg.render_svg(spec, mapping["mapping"], geo)
+    svg_text = svg.render_svg(spec, mapping["mapping"], geo, mapping["first_spoke"]["rim_hole"])
     return {
         "plan_id": plan_id,
         "version": version,
