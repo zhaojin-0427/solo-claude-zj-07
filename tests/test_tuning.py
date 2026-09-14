@@ -247,19 +247,20 @@ def test_proposals_baseline_and_ranking(plan_id, batch):
     bid = batch["batch_id"]
     holes = _holes(bid)
     cands = _proposals(bid, _readings(holes, lateral=0.5))
-    assert cands[0]["label"] == "no_action"
-    assert cands[0]["candidate_index"] == 0
-    assert cands[0]["steps"] == [] and cands[0]["spoke_actions"] == []
-    # 至少一个动作候选严格优于基线，且候选按官方字典序排序
-    assert len(cands) >= 2
+    # 全部候选（含不动作基线）统一按四项字典序排序，编号即名次
     keys = [(c["metrics"]["violation_count"], c["metrics"]["max_runout_mm"],
              c["metrics"]["local_tension_dispersion_n"], c["metrics"]["total_turns"])
             for c in cands]
-    assert keys[1:] == sorted(keys[1:])
-    assert keys[1] < keys[0]
+    assert keys == sorted(keys)
+    assert [c["candidate_index"] for c in cands] == list(range(len(cands)))
+    # 不动作候选仍在列表中（动作全空），但不固定置顶
+    no_action = cands[_no_action_index(cands)]
+    assert no_action["steps"] == [] and no_action["spoke_actions"] == []
+    # 碟形 0.5 下有动作方案严格优于不动作，且排在其前
+    assert len(cands) >= 2 and keys[0] < keys[_no_action_index(cands)]
+    best = cands[0]
     # 正横向偏移（轮圈偏右）的物理纠正：左侧收紧、右侧拧松
     # （左张角小、机械优势低；碟形从 0.5 压到接近 0 证实方向有效）
-    best = cands[1]
     right_dirs = [a["direction"] for a in best["spoke_actions"] if a["side"] == "right"]
     left_dirs = [a["direction"] for a in best["spoke_actions"] if a["side"] == "left"]
     if right_dirs:
@@ -267,11 +268,32 @@ def test_proposals_baseline_and_ranking(plan_id, batch):
     if left_dirs:
         assert left_dirs.count("tighten") >= left_dirs.count("loosen")
     assert best["metrics"]["dish_offset_mm"] < 0.35
+    # 步进只允许 1/8、1/4 圈；逐步预测含左右侧张力
     for s in best["steps"]:
-        assert s["turns"] in (0.125, 0.25, 0.5)
-        assert "predicted" in s and "max_runout_mm" in s["predicted"]
+        assert s["turns"] in (0.125, 0.25)
+        assert "max_runout_mm" in s["predicted"]
+        assert {"left", "right"} <= set(s["predicted_tension_by_side"])
+        assert s["predicted_tension_by_side"]["left"]["mean_n"] > 0
     # 逐步预测的终态 == 汇总终态
     assert best["steps"][-1]["predicted"]["max_runout_mm"] == best["metrics"]["max_runout_mm"]
+    assert best["steps"][-1]["predicted_tension_by_side"] == best["tension_by_side"]
+
+
+def test_violation_count_is_unique_holes(plan_id, batch):
+    # 同一孔同时径向、横向、张力超限，只计 1 个超限测点，issues 列出全部项
+    bid = batch["batch_id"]
+    holes = _holes(bid)
+    rd = _readings(holes, lateral=0.5)
+    # 孔 10：径向凸包 + 横向超限；读数 30 -> 1500 > 上限 1400
+    rd[10]["radial_mm"] = 0.9
+    rd[10]["gauge_reading"] = 30.0
+    a = client.post(f"/batches/{bid}/measurements", json={"readings": rd}).json()["analysis"]
+    v10 = next(v for v in a["violations"] if v["rim_hole"] == holes[10])
+    types = {i["type"] for i in v10["issues"]}
+    assert {"radial_runout", "lateral_runout", "tension_over_max"} <= types
+    # violation_count 按唯一孔位：与违规孔集合大小一致
+    assert a["metrics"]["violation_count"] == len(a["violations"])
+    assert len({v["rim_hole"] for v in a["violations"]}) == len(a["violations"])
 
 
 def test_proposal_uses_actual_hole_angles(plan_id, batch):
@@ -291,11 +313,15 @@ def test_proposal_uses_actual_hole_angles(plan_id, batch):
         "left": {"cross": 0}, "right": {"cross": 0},
     }
     pid = client.post("/plans", json=spec_ht).json()["plan_id"]
-    bid = client.post(f"/plans/{pid}/batches", json=BATCH).json()["batch"]["batch_id"]
+    bid = client.post(f"/plans/{pid}/batches?version=1", json=BATCH).json()["batch"]["batch_id"]
     holes = _holes(bid)
     cands = _proposals(bid, _readings(holes, lateral=0.5))
-    assert cands[0]["label"] == "no_action"
-    assert len(cands) >= 2
+    labels = [c["label"] for c in cands]
+    assert "no_action" in labels and len(cands) >= 2
+    keys = [(c["metrics"]["violation_count"], c["metrics"]["max_runout_mm"],
+             c["metrics"]["local_tension_dispersion_n"], c["metrics"]["total_turns"])
+            for c in cands]
+    assert keys == sorted(keys)  # 统一排序，非等距孔位同样成立
 
 
 def test_locked_spokes_not_adjusted(plan_id, batch):
@@ -307,7 +333,9 @@ def test_locked_spokes_not_adjusted(plan_id, batch):
     assert int(list(r.json()["batch"]["locks"].keys())[0]) == target
     cands = _proposals(bid, _readings(holes, radial=lambda i: 0.5 if i == 10 else 0.0,
                                       lateral=0.5))
-    for cand in cands[1:]:
+    for cand in cands:
+        if cand["label"] == "no_action":
+            continue
         assert target not in [a["rim_hole"] for a in cand["spoke_actions"]]
         assert any(b["rim_hole"] == target and "locked" in b["reasons"]
                    for b in cand["blocked_spokes"])
@@ -322,34 +350,68 @@ def test_lock_unknown_hole(plan_id, batch):
     assert r.status_code == 400 and r.json()["error"]["code"] == "BATCH_HOLE_UNKNOWN"
 
 
-def test_upper_limit_blocks_tightening(plan_id):
-    # 初始张力 900，上限设 900：所有孔达到上限，收紧类动作全部禁止
-    # （偏右 0.5 的碟形理论上需要右侧收紧，此时没有可行改善，只剩基线）
-    bid = client.post(f"/plans/{plan_id}/batches",
+def test_spokes_at_tension_limit_are_fully_excluded(plan_id):
+    # 初始张力 900、上限设 900：所有孔均已达上限，达限孔两个方向都不调整，
+    # 只剩不动作候选；blocked_spokes 以 at_tension_limit 标记全部 36 根。
+    bid = client.post(f"/plans/{plan_id}/batches?version=1",
                       json={**BATCH, "tension_max_n": 900.0}).json()["batch"]["batch_id"]
     holes = _holes(bid)
     cands = _proposals(bid, _readings(holes, lateral=0.5))
-    # 基线上全部 36 根都带 at_upper_limit_no_tighten 标记
+    assert [c["label"] for c in cands] == ["no_action"]
     blocked = {b["rim_hole"] for b in cands[0]["blocked_spokes"]
-               if "at_upper_limit_no_tighten" in b["reasons"]}
+               if "at_tension_limit" in b["reasons"]}
     assert blocked == set(holes)
-    # 任何动作候选中都不得出现越上限的收紧
-    for cand in cands[1:]:
-        for a in cand["spoke_actions"]:
-            if a["direction"] == "tighten":
-                assert a["tension_after_n"] <= 900.0 + 1e-6
+    assert cands[0]["spoke_actions"] == []
+    # 锁定原因与达限原因可同时出现
+    bid2 = client.post(f"/plans/{plan_id}/batches?version=1",
+                       json={**BATCH, "tension_max_n": 900.0}).json()["batch"]["batch_id"]
+    client.post(f"/batches/{bid2}/locks", json={"lock": [holes[0]]})
+    cands2 = _proposals(bid2, _readings(holes, lateral=0.5))
+    b0 = next(b for b in cands2[0]["blocked_spokes"] if b["rim_hole"] == holes[0])
+    assert b0["reasons"] == ["locked", "at_tension_limit"]
+
+
+def test_at_limit_spoke_gets_no_action_even_loosen(plan_id, batch):
+    # 只有一根孔因初始高读数达到上限：任何候选都不得对其收紧或拧松
+    bid = batch["batch_id"]
+    holes = _holes(bid)
+    rd = _readings(holes, lateral=0.5)
+    rd[0]["gauge_reading"] = 30.0  # 1500N > 上限 1400：初始即超限并达上限
+    cands = _proposals(bid, rd)
+    for cand in cands:
+        assert holes[0] not in [a["rim_hole"] for a in cand["spoke_actions"]]
+        if cand["label"] != "no_action":
+            assert any(b["rim_hole"] == holes[0] and "at_tension_limit" in b["reasons"]
+                       for b in cand["blocked_spokes"])
 
 
 # ---------------------------------------------------------------------------
 # 状态机：确认冻结、调整中、完成、定稿
 # ---------------------------------------------------------------------------
 
-def _confirm_first_round(bid, readings, candidate_index=1):
+def _confirm_first_round(bid, readings, candidate_index=None, no_action=False):
     cands = _proposals(bid, readings)
-    idx = min(candidate_index, len(cands) - 1)
+    if no_action:
+        idx = _no_action_index(cands)
+    elif candidate_index is None:
+        idx = _best_action_index(cands)
+    else:
+        idx = candidate_index
     r = client.post(f"/batches/{bid}/rounds/confirm", json={"candidate_index": idx})
     assert r.status_code == 201, r.text
     return r.json(), cands[idx]
+
+
+def _no_action_index(cands):
+    return next(i for i, c in enumerate(cands) if c["label"] == "no_action")
+
+
+def _best_action_index(cands):
+    """统一排序后第一个非不动作候选（四项字典序最优的有动作方案）。"""
+    for i, c in enumerate(cands):
+        if c["label"] != "no_action":
+            return i
+    return _no_action_index(cands)
 
 
 def test_confirm_freezes_measurement_actions_result(plan_id, batch):
@@ -367,9 +429,11 @@ def test_confirm_freezes_measurement_actions_result(plan_id, batch):
     b = client.get(f"/batches/{bid}/proposals")
     assert a.status_code == 200 and a.content == b.content
     assert a.json()["candidates"][fr["selected_candidate_index"]]["metrics"] == chosen["metrics"]
-    # 调整中禁止采集/锁定/再次确认
-    assert client.post(f"/batches/{bid}/measurements",
-                       json={"readings": _readings(holes)}).status_code == 400
+    # 调整中禁止采集/锁定/再次确认；测量错误详情带本次测点孔位
+    blocked = client.post(f"/batches/{bid}/measurements",
+                          json={"readings": _readings(holes)})
+    assert blocked.status_code == 400
+    assert blocked.json()["error"]["details"]["submitted_rim_holes"] == holes
     assert client.post(f"/batches/{bid}/locks", json={"lock": [0]}).status_code == 400
     assert client.post(f"/batches/{bid}/rounds/confirm",
                        json={"candidate_index": 0}).status_code == 400
@@ -394,7 +458,7 @@ def test_next_round_continues_from_snapshot(plan_id, batch):
             "radial_mm": 0.0, "lateral_mm": chosen["metrics"]["dish_offset_mm"]}
            for h in holes]
     assert client.post(f"/batches/{bid}/measurements", json={"readings": rd2}).status_code == 200
-    body2, _ = _confirm_first_round(bid, rd2, candidate_index=0)
+    body2, _ = _confirm_first_round(bid, rd2, no_action=True)
     assert body2["round"]["round"] == 2
     assert client.get(f"/batches/{bid}").json()["batch"]["rounds"][0]["candidate"]["metrics"] \
         == chosen["metrics"]
@@ -411,7 +475,7 @@ def test_confirm_bad_candidate_index(plan_id, batch):
 def test_cancel_round(plan_id, batch):
     bid = batch["batch_id"]
     holes = _holes(bid)
-    _confirm_first_round(bid, _readings(holes, lateral=0.5), candidate_index=0)
+    _confirm_first_round(bid, _readings(holes, lateral=0.5), no_action=True)
     r = client.post(f"/batches/{bid}/rounds/cancel")
     assert r.status_code == 200 and r.json()["batch"]["status"] == "collecting"
     # 已冻结轮保留在轨迹中
@@ -430,7 +494,7 @@ def test_finalize_requires_round(plan_id, batch):
 def test_finalize_blocks_appends_and_keeps_trajectory(plan_id, batch):
     bid = batch["batch_id"]
     holes = _holes(bid)
-    _confirm_first_round(bid, _readings(holes, lateral=0.5), candidate_index=0)
+    _confirm_first_round(bid, _readings(holes, lateral=0.5), no_action=True)
     client.post(f"/batches/{bid}/rounds/complete")
     r = client.post(f"/batches/{bid}/finalize")
     assert r.status_code == 200 and r.json()["batch"]["status"] == "finalized"
@@ -452,6 +516,27 @@ def test_finalize_blocks_appends_and_keeps_trajectory(plan_id, batch):
     assert "round_confirmed" in kinds
 
 
+def test_finalized_measurement_submission_points_to_readings(plan_id, batch):
+    bid = batch["batch_id"]
+    holes = _holes(bid)
+    _confirm_first_round(bid, _readings(holes, lateral=0.5), no_action=True)
+    client.post(f"/batches/{bid}/rounds/complete")
+    client.post(f"/batches/{bid}/finalize")
+    # 合法测点但批次已定稿：400 详情带本次提交的全部孔位
+    r = client.post(f"/batches/{bid}/measurements", json={"readings": _readings(holes)})
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["code"] == "BATCH_STATUS_INVALID"
+    assert err["details"]["submitted_rim_holes"] == holes
+    assert err["details"]["submitted_count"] == len(holes)
+    # 测点本身有问题（重复孔）：即使定稿也先指出重复测点
+    rd = _readings(holes)
+    dup = rd + [rd[0]]
+    r2 = client.post(f"/batches/{bid}/measurements", json={"readings": dup})
+    assert r2.status_code == 400
+    assert r2.json()["error"]["code"] == "MEASUREMENT_DUPLICATE_HOLE"
+
+
 def test_list_batches_and_404(plan_id, batch):
     assert client.get("/batches/trn_nonexistent").status_code == 404
     rows = client.get("/batches", params={"plan_id": plan_id}).json()["batches"]
@@ -470,18 +555,27 @@ def test_gap_weights_uniform():
 
 
 def test_per_side_tension_override(plan_id, batch):
-    # 左侧上限 800、初始 900：左孔全部标记不可收紧；右侧仍按全局 1400
-    body = {**BATCH, "tension_limits_override": {"left": {"min_n": 400, "max_n": 800}}}
+    # 右侧上限 900（初始张力 900 即达限）：右孔两个方向都不参与调整；
+    # 左侧仍按全局 1400，可自由收紧。
+    body = {**BATCH, "tension_limits_override": {"right": {"min_n": 400, "max_n": 900}}}
     bid = client.post(f"/plans/{plan_id}/batches?version=1", json=body).json()["batch"]["batch_id"]
     holes = _holes(bid)
     spokes = {s["rim_hole"]: s["side"]
               for s in client.get(f"/batches/{bid}").json()["batch"]["spokes"]}
     cands = _proposals(bid, _readings(holes, lateral=0.5))
-    left_flagged = {b["rim_hole"] for b in cands[0]["blocked_spokes"]
-                    if spokes[b["rim_hole"]] == "left" and "at_upper_limit_no_tighten" in b["reasons"]}
-    right_flagged = {b["rim_hole"] for b in cands[0]["blocked_spokes"]
-                     if spokes[b["rim_hole"]] == "right" and "at_upper_limit_no_tighten" in b["reasons"]}
-    assert len(left_flagged) == 18 and right_flagged == set()
+    no_action = cands[_no_action_index(cands)]
+    left_flagged = {b["rim_hole"] for b in no_action["blocked_spokes"]
+                    if spokes[b["rim_hole"]] == "left" and "at_tension_limit" in b["reasons"]}
+    right_flagged = {b["rim_hole"] for b in no_action["blocked_spokes"]
+                     if spokes[b["rim_hole"]] == "right" and "at_tension_limit" in b["reasons"]}
+    assert len(right_flagged) == 18 and left_flagged == set()
+    # 任何动作候选都不调整右孔（即便拧松也不行）
+    for cand in cands:
+        if cand["label"] == "no_action":
+            continue
+        acted_right = {a["rim_hole"] for a in cand["spoke_actions"]
+                       if a["side"] == "right"}
+        assert acted_right == set()
 
 
 def test_cumulative_turns_accumulate_across_rounds(plan_id, batch):
@@ -500,7 +594,7 @@ def test_cumulative_turns_accumulate_across_rounds(plan_id, batch):
     rd2 = [{"rim_hole": h, "gauge_reading": g(post_t.get(h, 900.0)),
             "radial_mm": 0.0, "lateral_mm": chosen["metrics"]["dish_offset_mm"]}
            for h in holes]
-    body2, _ = _confirm_first_round(bid, rd2, candidate_index=0)
+    body2, _ = _confirm_first_round(bid, rd2, no_action=True)
     assert body2["round"]["cumulative_turns"] == fr1
     # 定稿轨迹保留每轮累计值与来源版本
     client.post(f"/batches/{bid}/rounds/complete")

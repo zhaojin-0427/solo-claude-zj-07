@@ -50,9 +50,11 @@ TUNING_FORMULAS = {
     "eccentricity": "加权一阶谐波：e_x=Σw_i·r_i·cosθ_i, e_y=Σw_i·r_i·sinθ_i；偏心量=hypot(e_x,e_y)",
     "dish_offset": "碟形偏移 = Σw_i·z_i（横向读数相对零位，正 = 偏右/驱动侧）",
     "local_dispersion": "同侧角序 5 孔循环滑动窗内张力标准差，取各侧窗均值/最大值",
-    "step_granularity": "条帽步进以 1/8 圈（45°）为最小单位；编排按层铺放（先 1/2=4 单位、再 1/4=2、最后 1/8=1），层内左右就近配对交错，逐步预测",
-    "search": "阶段一平滑目标（超限平方+残差平方+碟形/偏心全局项）引导越门限与多孔协调；阶段二按官方字典序精修（含持平行走），只输出严格优于不动作基线的候选",
-    "candidate_ranking": "候选依次比较：超限测点数↑ → 最大跳动 hypot(径,横)↑ → 局部张力离散度↑ → 总转动量↑（全部取小）",
+    "violation_count": "超限测点数按**唯一孔位**计数：同一孔同时径向/横向/张力超限只计 1，各项列入该孔 issues",
+    "step_granularity": "条帽步进只允许 1/8 圈（45°，1 单位）或 1/4 圈（90°，2 单位）；编排按层铺放（先 1/4 再 1/8），层内左右就近配对交错，逐步预测跳动与左右张力",
+    "immovable_spokes": "锁定孔，或本轮初始张力已达上/下限的孔，两个方向（收紧/拧松）都不参与调整，列入 blocked_spokes",
+    "search": "阶段一平滑目标（超限平方+残差平方+碟形/偏心全局项）引导越门限与多孔协调；阶段二按官方字典序精修（含持平行走）",
+    "candidate_ranking": "**全部候选（含不动作基线）统一**按字典序排列，不固定置顶：超限测点数↑ → 最大跳动 hypot(径,横)↑ → 局部张力离散度↑ → 总转动量↑（全部取小）",
 }
 
 
@@ -247,24 +249,28 @@ def summarize(name_idx: list[dict], weights: list[float], radial: list[float],
     combined = [math.hypot(rr, ll) for rr, ll in zip(res_r, res_l)]
     peak_i = max(range(n), key=lambda i: combined[i])
 
+    # 超限测点按**唯一孔位**统计：同一孔同时有径向/横向/张力超限，
+    # 只计 1 个超限测点；具体各项保留在该孔的 issues 中。
     violations = []
     for i, s in enumerate(name_idx):
+        issues = []
         if abs(res_r[i]) > limits["radial_tolerance_mm"] + 1e-9:
-            violations.append({"rim_hole": s["rim_hole"], "side": s["side"],
-                               "type": "radial_runout", "value_mm": r3(res_r[i]),
-                               "limit_mm": r3(limits["radial_tolerance_mm"])})
+            issues.append({"type": "radial_runout", "value_mm": r3(res_r[i]),
+                           "limit_mm": r3(limits["radial_tolerance_mm"])})
         if abs(res_l[i]) > limits["lateral_tolerance_mm"] + 1e-9:
-            violations.append({"rim_hole": s["rim_hole"], "side": s["side"],
-                               "type": "lateral_runout", "value_mm": r3(res_l[i]),
-                               "limit_mm": r3(limits["lateral_tolerance_mm"])})
+            issues.append({"type": "lateral_runout", "value_mm": r3(res_l[i]),
+                           "limit_mm": r3(limits["lateral_tolerance_mm"])})
         if tension[i] > limits["tension_max_n"][i] + 1e-9:
-            violations.append({"rim_hole": s["rim_hole"], "side": s["side"],
-                               "type": "tension_over_max", "value_n": r3(tension[i]),
-                               "limit_n": r3(limits["tension_max_n"][i])})
+            issues.append({"type": "tension_over_max", "value_n": r3(tension[i]),
+                           "limit_n": r3(limits["tension_max_n"][i])})
         if tension[i] < limits["tension_min_n"][i] - 1e-9:
-            violations.append({"rim_hole": s["rim_hole"], "side": s["side"],
-                               "type": "tension_under_min", "value_n": r3(tension[i]),
-                               "limit_n": r3(limits["tension_min_n"][i])})
+            issues.append({"type": "tension_under_min", "value_n": r3(tension[i]),
+                           "limit_n": r3(limits["tension_min_n"][i])})
+        if issues:
+            violations.append({
+                "rim_hole": s["rim_hole"], "side": s["side"],
+                "issue_count": len(issues), "issues": issues,
+            })
 
     metrics = {
         "violation_count": len(violations),
@@ -475,20 +481,29 @@ def _search_variant(spokes, weights, radial0, lateral0, tension0, limits, inf,
                     locks, max_units, step_units_set, cap=400):
     """两阶段贪心，输出整轮各孔转动量（1/8 圈整数单位）。
 
-    阶段一（引导）：单孔 + 左右成对动作沿平滑目标下山，使方案能越过
-        超限门限并完成碟形/偏心所需的多孔协调；
+    锁定孔与初始张力已达上/下限的孔（immovable）完全不参与任何方向的调整；
+    动作过程中也不得越过张力窗口。阶段一（引导）：单孔 + 左右成对动作沿
+        平滑目标下山，使方案能越过超限门限并完成碟形/偏心所需的多孔协调；
     阶段二（精修）：从阶段一终点起，只接受使官方字典序
         （超限量→最大跳动→局部张力离散度→总转动量）严格变小或
         前三项持平的动作（少量持平行走以跨越单步平台），记录沿途最佳。
     """
     n = len(spokes)
     units = [0] * n
-    locked = set(locks)
     radial, lateral, tension = list(radial0), list(lateral0), list(tension0)
     rad_tol = limits["radial_tolerance_mm"]
     lat_tol = limits["lateral_tolerance_mm"]
     columns = inf["columns"]
     rad_m, lat_m, k_m = inf["radial"], inf["lateral"], inf["stiffness_n_per_turn"]
+
+    # 不可调整孔：锁定孔，或本轮**初始**张力已达上/下限的孔——
+    # 达限孔两个方向都不参与（既不收紧也不拧松泄压）。
+    immovable = set(locks)
+    for j in range(n):
+        if tension0[j] >= limits["tension_max_n"][j] - 1e-9:
+            immovable.add(spokes[j]["rim_hole"])
+        if tension0[j] <= limits["tension_min_n"][j] + 1e-9:
+            immovable.add(spokes[j]["rim_hole"])
 
     local_pairs = set()
     for j in range(n):
@@ -504,9 +519,14 @@ def _search_variant(spokes, weights, radial0, lateral0, tension0, limits, inf,
                     math.sin(spokes[i]["angle_rad"] - spokes[j]["angle_rad"]),
                     math.cos(spokes[i]["angle_rad"] - spokes[j]["angle_rad"]))))
         local_pairs.add((min(j, k), max(j, k)))
-    pairs = sorted(local_pairs)
+    pairs = sorted(
+        (j, k) for j, k in local_pairs
+        if spokes[j]["rim_hole"] not in immovable
+        and spokes[k]["rim_hole"] not in immovable
+    )
 
     def feasible(j, sign, du_units):
+        # 动作过程中也不得越过张力窗口（达限孔已在 immovable 中整体排除）
         nu = units[j] + sign * du_units
         if abs(nu) > max_units:
             return False
@@ -520,15 +540,13 @@ def _search_variant(spokes, weights, radial0, lateral0, tension0, limits, inf,
     def all_moves():
         moves = []
         for j in range(n):
-            if spokes[j]["rim_hole"] in locked:
+            if spokes[j]["rim_hole"] in immovable:
                 continue
             for step in step_units_set:
                 for sign in (1, -1):
                     if feasible(j, sign, step):
                         moves.append(((j, sign * step),))
         for j, k in pairs:
-            if (spokes[j]["rim_hole"] in locked or spokes[k]["rim_hole"] in locked):
-                continue
             for step in step_units_set:
                 for sign in (1, -1):
                     if feasible(j, sign, step) and feasible(k, -sign, step):
@@ -643,9 +661,10 @@ def _build_steps(spokes, inf, radial0, lateral0, tension0, weights, limits,
                  units: list[int], start_angle: float) -> list[dict]:
     """把整轮动作编排为可执行步进。
 
-    每孔转动量分解为分层 chunk 序列（先 1/2 圈、再 1/4、最后 1/8，
-    每孔每层至多一个 chunk）。按层展开，层内自起始角沿角序、左右就近
-    配对交错，避免先把单孔深拧到位。逐步预测执行后的跳动与左右张力。
+    条帽步进只允许 **1/4 圈（2 单位）与 1/8 圈（1 单位）**。
+    每孔转动量按层铺放（先 1/4、再 1/8，每孔每层至多一步），层内自
+    起始角沿角序、左右就近配对交错，避免先把单孔深拧到位。逐步预测
+    执行后的跳动、**左右侧张力**与累计转动量。
     """
     n = len(spokes)
 
@@ -665,7 +684,7 @@ def _build_steps(spokes, inf, radial0, lateral0, tension0, weights, limits,
 
     actions: list[tuple[int, int]] = []
     consumed = {i: 0 for i in active}  # 已被更大档消耗的单位量
-    for chunk in (4, 2, 1):
+    for chunk in (2, 1):
         # 该层每孔贡献一个 chunk（按扣除更大档后的剩余量），直到该档取尽
         depth = {i: (abs(units[i]) - consumed[i]) // chunk for i in active}
         while any(v > 0 for v in depth.values()):
@@ -712,13 +731,19 @@ def _build_steps(spokes, inf, radial0, lateral0, tension0, weights, limits,
             "direction": "tighten" if du > 0 else "loosen",
             "turns": r3(abs(du) / UNIT),
             "predicted": m,
+            "predicted_tension_by_side": sm["tension_by_side"],
         })
     return steps
 
 
 def build_candidates(batch: dict, spokes: list[dict], weights: list[float],
                      inf: dict, analysis: dict, start_angle: float) -> list[dict]:
-    """生成并排序候选方案；候选 0 恒为不动作基线（可直接确认冻结本轮测量）。"""
+    """生成候选方案并**统一按四项字典序排序**（含不动作基线，不强制置顶）。
+
+    排序键：超限测点数（按唯一孔位）→ 最大跳动 → 局部张力离散度 → 总转动量。
+    动作步进只允许 1/8 与 1/4 圈。锁定孔与初始张力达上/下限的孔不参与调整，
+    各候选在 blocked_spokes 中给出原因（locked / at_tension_limit）。
+    """
     n = len(spokes)
     limits = _limits_arrays(batch, spokes)
     pmap = {p["rim_hole"]: i for i, p in enumerate(spokes)}
@@ -733,6 +758,13 @@ def build_candidates(batch: dict, spokes: list[dict], weights: list[float],
 
     locks = {h for h in batch.get("locks", {}) if isinstance(h, int)}
     max_units = int(round(batch["max_turns_per_spoke"] * UNIT))
+
+    # 初始张力已达上/下限的孔：两个方向都不得调整
+    at_limit = {
+        s["rim_hole"] for j, s in enumerate(spokes)
+        if tension0[j] >= limits["tension_max_n"][j] - 1e-9
+        or tension0[j] <= limits["tension_min_n"][j] + 1e-9
+    }
 
     def package(label, units):
         r, l, t = _apply_units(radial0, lateral0, tension0, inf, units)
@@ -757,10 +789,8 @@ def build_candidates(batch: dict, spokes: list[dict], weights: list[float],
             reasons = []
             if hole in locks:
                 reasons.append("locked")
-            if tension0[j] >= limits["tension_max_n"][j] - 1e-9:
-                reasons.append("at_upper_limit_no_tighten")
-            if tension0[j] <= limits["tension_min_n"][j] + 1e-9:
-                reasons.append("at_lower_limit_no_loosen")
+            if hole in at_limit:
+                reasons.append("at_tension_limit")
             if reasons:
                 blocked.append({"rim_hole": hole, "side": s["side"], "reasons": reasons})
         return {
@@ -771,16 +801,20 @@ def build_candidates(batch: dict, spokes: list[dict], weights: list[float],
             "spoke_actions": per_spoke,
             "blocked_spokes": blocked,
             "steps": steps,
+            "_rank_key": (
+                sm["metrics"]["violation_count"],
+                sm["metrics"]["max_runout_mm"],
+                sm["metrics"]["local_tension_dispersion_n"],
+                r3(total_turns),
+            ),
         }
 
+    # 两个搜索变体都只使用 1/8、1/4 圈步进
     variants = [
-        ("quarter_eighth_half", {4, 2, 1}),
-        ("eighth_quarter", {1, 2}),
+        ("eighth_and_quarter", {1, 2}),
+        ("eighth_only", {1}),
     ]
     results = [package("no_action", [0] * n)]
-    baseline = summarize(spokes, weights, radial0, lateral0, tension0, limits,
-                         include_violations=False)
-    baseline_key = metrics_key(baseline, 0.0)
     seen = {tuple([0] * n)}
     for label, step_set in variants:
         units, _ = _search_variant(spokes, weights, radial0, lateral0, tension0,
@@ -788,22 +822,12 @@ def build_candidates(batch: dict, spokes: list[dict], weights: list[float],
         key = tuple(units)
         if key in seen or not any(units):
             continue
-        r, l, t = _apply_units(radial0, lateral0, tension0, inf, units)
-        sm = summarize(spokes, weights, r, l, t, limits, include_violations=False)
-        total = sum(abs(x) for x in units) / UNIT
-        # 代理/平台搜索只是手段：官方字典序不严格优于不动作基线的候选不输出
-        if not metrics_key(sm, total) < baseline_key:
-            continue
         seen.add(key)
         results.append(package(label, units))
 
-    ranked = [results[0]] + sorted(
-        results[1:],
-        key=lambda c: (c["metrics"]["violation_count"],
-                       c["metrics"]["max_runout_mm"],
-                       c["metrics"]["local_tension_dispersion_n"],
-                       c["metrics"]["total_turns"]),
-    )
-    for idx, cand in enumerate(ranked):
+    # 全部候选（含不动作基线）统一按四项字典序排列
+    results.sort(key=lambda c: c["_rank_key"])
+    for idx, cand in enumerate(results):
         cand["candidate_index"] = idx
-    return ranked
+        cand.pop("_rank_key")
+    return results

@@ -242,11 +242,25 @@ def update_locks(batch_id: str, req: LockRequest):
 @router.post("/batches/{batch_id}/measurements")
 def submit_measurement(batch_id: str, payload: MeasurementSubmit):
     state, _, _ = _load(batch_id)
-    _require_status(state, {"collecting"}, "追加测量数据（已定稿批次拒绝追加）")
     spokes = _state_spokes(state)
     curve = [(p["reading"], p["tension_n"]) for p in state["calibration_curve"]]
     readings = [r.model_dump() for r in payload.readings]
+    # 测点校验先于状态机：即使调整中/已定稿，缺测、重复、越界等错误
+    # 仍能指到本次提交的测点
     by_idx = tuning.validate_readings(readings, spokes, curve)
+    if state["status"] != "collecting":
+        raise WheelError(
+            "BATCH_STATUS_INVALID",
+            f"批次当前状态为 {state['status']}，不能追加测量数据"
+            f"（仅采集中允许提交；已定稿批次不可追加）",
+            {
+                "status": state["status"],
+                "allowed": ["collecting"],
+                "action": "submit_measurements",
+                "submitted_count": len(readings),
+                "submitted_rim_holes": [r["rim_hole"] for r in readings],
+            },
+        )
     weights = state["gap_weights"]
     analysis = tuning.analyze_measurement(state, spokes, weights, by_idx)
 
