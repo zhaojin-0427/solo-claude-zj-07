@@ -130,10 +130,8 @@ def test_duplicate_rim_hole_mapping():
     override = [{"side": "right", "rim_hole": 0, "hub_hole": 0}] * 2
     spec = _spec(mapping_override=override)
     r = client.post("/plans", json=spec)
-    assert r.status_code == 400
-    err = r.json()["error"]
-    assert err["code"] == "DUPLICATE_HOLE_MAPPING"
-    assert err["details"]["rim_hole"] == 0
+    assert r.status_code == 422  # 圈孔重复占用在 Pydantic 输入校验阶段拒绝
+    assert "圈孔 0 被重复占用" in r.text
 
 
 def test_duplicate_hub_hole_mapping():

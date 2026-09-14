@@ -1,13 +1,15 @@
 """孔位映射、阀孔避让、首根定位与编轮次序。
 
-自动穿法按**实际孔位**搜索：枚举方向相位（phase 0/1，即顺/逆向组从哪个
-角序位置开始）与每侧法兰对齐（shift 0..n-1，即孔位双射的整体旋转），
-保留满足以下条件的候选：
-- 交叉方向：每根辐条实际夹角符号与其顺/逆向一致；
-- 交叉数：实际夹角折算的交叉数 k_eff = round(|delta| / 节距) 等于设置值；
+自动穿法按**实际孔位**回溯搜索孔位双射（不限于整体循环移位）：
+逐角序圈孔分配法兰孔，约束均按实际几何判定——
+- 交叉方向：同向（同为顺/逆向）辐条的弦不得相交；
+- 交叉数：每根辐条与反向辐条的实际弦交叉数必须等于设置值
+  （k=0 径向时任何交叉都不可）；
+- k>0 时顺/逆向辐条数量平衡（各半）；
 - 阀孔净空：阀孔到最近辐条弦的距离 >= valve_clearance_min_mm。
-在可行候选中取阀孔净空最大者（并列时取夹角散布最小、shift 最小者）；
-无解时抛出 LACING_INFEASIBLE 并给出冲突孔。
+在全部合法双射中取阀孔净空最大者（并列时取夹角散布最小、搜索序最先者）；
+无解时抛出 LACING_INFEASIBLE 并给出冲突孔（按循环移位候选中冲突最少者
+的实际几何交叉诊断）。
 """
 
 from __future__ import annotations
@@ -26,6 +28,11 @@ from .geometry import (
     valve_angle,
 )
 
+# 回溯搜索上限：防止病态孔位下搜索失控
+_MAX_SEARCH_NODES = 300_000
+_MAX_SEARCH_NODES_FALLBACK = 100_000
+_MAX_SOLUTIONS_PER_SIDE = 300
+
 
 def _pt_seg_dist(p, a, b) -> float:
     ax, ay = a
@@ -37,6 +44,19 @@ def _pt_seg_dist(p, a, b) -> float:
     t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
     t = max(0.0, min(1.0, t))
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _orient(a, b, c) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _segments_cross(p1, p2, p3, p4) -> bool:
+    """两弦严格相交（双射保证端点各异，不会共享端点）。"""
+    d1 = _orient(p3, p4, p1)
+    d2 = _orient(p3, p4, p2)
+    d3 = _orient(p1, p2, p3)
+    d4 = _orient(p1, p2, p4)
+    return d1 * d2 < 0.0 and d3 * d4 < 0.0
 
 
 def _insertion(direction: str, heads_in: str) -> str:
@@ -72,72 +92,263 @@ def _valve_clearance_mm(spec, layout, entries: list[dict], v_pt=None) -> float:
     return best
 
 
-def _side_phase_candidates(spec, layout, side: str, n_side: int, phase: int,
-                           v_pt, rim_r: float) -> list[dict]:
-    """枚举该侧在给定方向相位下的全部法兰对齐（shift 0..n-1）候选。
+def _cross_masks(rim_pts: list, hub_pts: list, n: int) -> list:
+    """预计算交叉位掩码：mask[m][j][m2] 的第 j2 位 = (m->j) 与 (m2->j2) 是否交叉。
 
-    映射按角序生成：角序第 m 个圈孔 -> 角序第 (m + shift ± cross) 个法兰孔，
-    即在实际孔位上搜索孔位双射；每个候选附带交叉方向/交叉数冲突列表。
+    交叉关系对称，先算 m2 > m 的上三角再镜像，避免 O(n^4) 重复计算。
     """
-    lac = getattr(spec, side)
-    k = lac.cross
+    masks = [[[0] * n for _ in range(n)] for _ in range(n)]
+    for m in range(n):
+        p1 = rim_pts[m]
+        for j in range(n):
+            p2 = hub_pts[j]
+            row = masks[m][j]
+            for m2 in range(m + 1, n):
+                q1 = rim_pts[m2]
+                bits = 0
+                for j2 in range(n):
+                    if _segments_cross(p1, p2, q1, hub_pts[j2]):
+                        bits |= 1 << j2
+                row[m2] = bits
+    for m in range(n):
+        for j in range(n):
+            for m2 in range(m + 1, n):
+                bits = masks[m][j][m2]
+                if not bits:
+                    continue
+                for j2 in range(n):
+                    if (bits >> j2) & 1:
+                        masks[m2][j2][m] |= 1 << j
+    return masks
+
+
+def _side_assignments(layout, side: str, n_side: int, k: int,
+                      rim_r: float, flange_r: float):
+    """回溯搜索该侧全部合法孔位双射。
+
+    返回 (圈孔角序, [assign])；assign[m] = 角序第 m 个圈孔分配的法兰孔号。
+    约束：同向辐条弦不相交、每根辐条与反向辐条的实际交叉数 == k、
+    k>0 时顺/逆向各 n/2 根。候选按 |delta| 接近 k 倍节距排序，先找到紧凑解。
+    两阶段：先在 |delta| ∈ k·节距 ± 半节距 的紧凑窗口内搜索（覆盖常规轮组），
+    无解再在完整域上搜索（非等距孔位下合法解可能跨度更大）。
+    """
+    order = [i for i in layout.rim_order if layout.rim_sides[i] == side]
+    rim_ang = [layout.rim_angles[i] for i in order]
+    rim_pts = [(rim_r * math.cos(a), rim_r * math.sin(a)) for a in rim_ang]
+    hub_ang = layout.hub_angles[side]
+    hub_pts = [(flange_r * math.cos(a), flange_r * math.sin(a)) for a in hub_ang]
     pitch = TWO_PI / n_side
+    target = k * pitch
+    half = n_side // 2
+    deltas = [[_wrap_pi(hub_ang[j] - rim_ang[m]) for j in range(n_side)] for m in range(n_side)]
+    masks = _cross_masks(rim_pts, hub_pts, n_side)
+    solutions: list[tuple] = []
+
+    def backtrack(window, node_cap: int) -> None:
+        assign = [-1] * n_side
+        used = [False] * n_side
+        dirs = [0] * n_side
+        counts = [0] * n_side
+        nodes = [0]
+
+        def rec(m: int, n_trail: int) -> None:
+            if len(solutions) >= _MAX_SOLUTIONS_PER_SIDE or nodes[0] > node_cap:
+                return
+            if m == n_side:
+                if all(c == k for c in counts):
+                    solutions.append(tuple(assign))
+                return
+            nodes[0] += 1
+            row = deltas[m]
+            cands = []
+            for j in range(n_side):
+                if used[j]:
+                    continue
+                delta = row[j]
+                if k > 0 and abs(delta) < 1e-9:
+                    continue
+                if window is not None and abs(abs(delta) - target) > window:
+                    continue
+                cands.append((abs(abs(delta) - target), j, delta))
+            cands.sort()
+            remaining = n_side - m - 1  # 当前孔之后尚未分配的圈孔数
+            mask_row = masks[m]
+            for _, j, delta in cands:
+                d = 0 if abs(delta) < 1e-9 else (1 if delta > 0 else -1)
+                n_t = n_trail + (1 if d > 0 else 0)
+                if k > 0 and (n_t > half or (m + 1) - n_t > half):
+                    continue
+                crossed = []
+                ok = True
+                mj = mask_row[j]
+                for m2 in range(m):
+                    if not (mj[m2] >> assign[m2]) & 1:
+                        continue
+                    if d != 0 and dirs[m2] == d:
+                        ok = False  # 同向辐条交叉
+                        break
+                    if counts[m2] + 1 > k:
+                        ok = False  # 对方交叉数超限
+                        break
+                    crossed.append(m2)
+                if not ok or len(crossed) > k:
+                    continue
+                # 当前辐条自身最终交叉数不可能达到 k 时剪枝
+                if len(crossed) + remaining < k:
+                    continue
+                # 已分配辐条（含当前辐条带来的交叉）最终交叉数不可能达到 k 时剪枝
+                cset = set(crossed)
+                if any(counts[m2] + (1 if m2 in cset else 0) + remaining < k
+                       for m2 in range(m)):
+                    continue
+                assign[m] = j
+                used[j] = True
+                dirs[m] = d
+                counts[m] = len(crossed)
+                for m2 in crossed:
+                    counts[m2] += 1
+                rec(m + 1, n_t)
+                for m2 in crossed:
+                    counts[m2] -= 1
+                counts[m] = 0
+                dirs[m] = 0
+                used[j] = False
+                assign[m] = -1
+
+        rec(0, 0)
+
+    # 阶段一：紧凑窗口（常规轮组在此完成，含等距与典型成对钻孔）
+    backtrack(0.5 * pitch, _MAX_SEARCH_NODES)
+    # 阶段二：完整域（非等距孔位下合法解可能超出窗口）
+    if not solutions:
+        backtrack(None, _MAX_SEARCH_NODES_FALLBACK)
+    return order, solutions
+
+
+def _solution_entries(layout, side: str, order: list[int], assign: tuple, lac, k: int):
+    """由双射生成映射条目与夹角散布 dev。"""
+    hub_ang = layout.hub_angles[side]
+    pitch = TWO_PI / len(order)
+    entries = []
+    dev = 0.0
+    for m, rim_id in enumerate(order):
+        j = assign[m]
+        delta = _wrap_pi(hub_ang[j] - layout.rim_angles[rim_id])
+        if k > 0:
+            direction = "trailing" if delta > 0 else "leading"
+        else:
+            direction = "radial" if abs(delta) < 1e-9 else ("trailing" if delta > 0 else "leading")
+        dev += abs(abs(delta) - k * pitch)
+        entries.append({
+            "rim_hole": rim_id,
+            "side": side,
+            "hub_hole": j,
+            "direction": direction,
+            "insertion": _insertion(direction, lac.heads_in),
+        })
+    return entries, dev
+
+
+def _cyclic_assignments(layout, side: str, n_side: int, k: int):
+    """旧式整体循环移位候选（仅用于无解时的冲突诊断）。"""
     order = [i for i in layout.rim_order if layout.rim_sides[i] == side]
     h_order = sorted(range(n_side), key=lambda j: (layout.hub_angles[side][j], j))
-    cands = []
-    for shift in range(n_side):
-        entries, conflicts = [], []
-        dev = 0.0
-        for m, rim_id in enumerate(order):
-            if k > 0:
-                direction = "trailing" if (m + phase) % 2 == 0 else "leading"
-            else:
-                direction = "radial"
-            hj = (m + shift - k) % n_side if direction == "leading" else (m + shift + k) % n_side
-            hub_hole = h_order[hj]
-            a_r = layout.rim_angles[rim_id]
-            a_h = layout.hub_angles[side][hub_hole]
-            delta = _wrap_pi(a_h - a_r)
-            abs_delta = abs(delta)
-            k_eff = int(round(abs_delta / pitch))
-            if k > 0:
-                want = 1.0 if direction == "trailing" else -1.0
-                if delta * want <= 1e-9:
-                    conflicts.append({
-                        "rim_hole": rim_id,
-                        "side": side,
-                        "hub_hole": hub_hole,
-                        "reason": "cross_direction",
-                        "delta_deg": r3(math.degrees(delta)),
-                        "expected_delta_deg": r3(math.degrees(want * k * pitch)),
-                    })
-            if k_eff != k:
+    for phase in (0, 1):
+        for shift in range(n_side):
+            assign = []
+            for m in range(n_side):
+                trailing = (m + phase) % 2 == 0
+                hj = (m + shift + k) % n_side if (trailing or k == 0) else (m + shift - k) % n_side
+                assign.append(h_order[hj])
+            yield phase, shift, order, assign
+
+
+def _diagnose_side(layout, side: str, n_side: int, k: int,
+                   rim_r: float, flange_r: float) -> list[dict]:
+    """无解侧诊断：在循环移位候选中按实际几何交叉找逐孔冲突最少者。"""
+    best = None
+    for phase, shift, order, assign in _cyclic_assignments(layout, side, n_side, k):
+        rim_pts = [(rim_r * math.cos(layout.rim_angles[i]), rim_r * math.sin(layout.rim_angles[i]))
+                   for i in order]
+        hub_pts = [(flange_r * math.cos(layout.hub_angles[side][j]),
+                    flange_r * math.sin(layout.hub_angles[side][j])) for j in range(n_side)]
+        dirs = []
+        for m in range(n_side):
+            delta = _wrap_pi(layout.hub_angles[side][assign[m]] - layout.rim_angles[order[m]])
+            dirs.append(0 if abs(delta) < 1e-9 else (1 if delta > 0 else -1))
+        counts = [0] * n_side
+        bad_same = [False] * n_side
+        for a in range(n_side):
+            for b in range(a + 1, n_side):
+                if not _segments_cross(rim_pts[a], hub_pts[assign[a]], rim_pts[b], hub_pts[assign[b]]):
+                    continue
+                if dirs[a] != 0 and dirs[a] == dirs[b]:
+                    bad_same[a] = bad_same[b] = True
+                else:
+                    counts[a] += 1
+                    counts[b] += 1
+        conflicts = []
+        for m in range(n_side):
+            rim_id = order[m]
+            j = assign[m]
+            delta = _wrap_pi(layout.hub_angles[side][j] - layout.rim_angles[rim_id])
+            if bad_same[m]:
                 conflicts.append({
                     "rim_hole": rim_id,
                     "side": side,
-                    "hub_hole": hub_hole,
-                    "reason": "cross_count",
-                    "cross_requested": k,
-                    "cross_effective": k_eff,
+                    "hub_hole": j,
+                    "reason": "cross_direction",
                     "delta_deg": r3(math.degrees(delta)),
                 })
-            dev += abs(abs_delta - k * pitch)
-            entries.append({
-                "rim_hole": rim_id,
-                "side": side,
-                "hub_hole": hub_hole,
-                "direction": direction,
-                "insertion": _insertion(direction, lac.heads_in),
-            })
-        clearance = _valve_clearance_mm(spec, layout, entries, v_pt)
-        cands.append({
-            "entries": entries,
-            "conflicts": conflicts,
-            "dev": dev,
-            "clearance": clearance,
-            "shift": shift,
-        })
-    return cands
+            elif counts[m] != k:
+                conflicts.append({
+                    "rim_hole": rim_id,
+                    "side": side,
+                    "hub_hole": j,
+                    "reason": "cross_count",
+                    "cross_requested": k,
+                    "cross_effective": counts[m],
+                    "delta_deg": r3(math.degrees(delta)),
+                })
+        key = (len(conflicts), phase, shift)
+        if best is None or key < best[0]:
+            best = (key, conflicts)
+    return best[1]
+
+
+def _cyclic_form(order: list[int], assign: tuple, layout, side: str, n_side: int, k: int):
+    """若解等价于某 (phase, shift) 的整体循环移位，返回 (phase, shift)，否则 None。"""
+    h_order = sorted(range(n_side), key=lambda j: (layout.hub_angles[side][j], j))
+    pos = {j: r for r, j in enumerate(h_order)}
+    ranks = [pos[j] for j in assign]
+    for phase in (0, 1):
+        for shift in range(n_side):
+            ok = True
+            for m in range(n_side):
+                trailing = (m + phase) % 2 == 0
+                hj = (m + shift + k) % n_side if (trailing or k == 0) else (m + shift - k) % n_side
+                if ranks[m] != hj:
+                    ok = False
+                    break
+            if ok:
+                return phase, shift
+    return None
+
+
+def _derive_phase_shift(cl: dict, cr: dict, layout, n_side: int, spec):
+    """由最终双射反推 phase / flange_shift（非循环解的侧为 None）。"""
+    forms = {}
+    for side, c in (("left", cl), ("right", cr)):
+        forms[side] = _cyclic_form(c["order"], c["assign"], layout, side, n_side,
+                                   getattr(spec, side).cross)
+    if forms["right"] is not None:
+        phase = forms["right"][0]
+    else:
+        rank0 = next(e for e in cr["entries"] if e["rim_hole"] == cr["order"][0])
+        phase = 0 if rank0["direction"] == "trailing" else 1
+    shifts = {side: (forms[side][1] if forms[side] is not None else None)
+              for side in ("left", "right")}
+    return phase, shifts
 
 
 def _nearest_to_valve(spec, layout, entries: list[dict], v_pt, rim_r: float, limit: int = 2) -> list[dict]:
@@ -160,42 +371,47 @@ def _nearest_to_valve(spec, layout, entries: list[dict], v_pt, rim_r: float, lim
 
 
 def _search_lacing(spec, layout, n_side: int):
-    """按实际孔位搜索方向相位与孔位双射，返回 (entries, clearance, phase, shifts)。"""
+    """按实际孔位搜索孔位双射，返回 (entries, clearance, phase, shifts)。"""
     rim_r = spec.rim.erd_mm / 2.0
     v_ang = valve_angle(layout, spec.rim.valve_position)
     v_pt = (rim_r * math.cos(v_ang), rim_r * math.sin(v_ang))
     req = spec.valve_clearance_min_mm
-    best = None      # 可行候选中的最优（净空最大）
-    fallback = None  # 冲突最少（再比净空）的候选，用于无解时报错
-    for phase in (0, 1):
-        cands = {
-            side: _side_phase_candidates(spec, layout, side, n_side, phase, v_pt, rim_r)
-            for side in ("left", "right")
-        }
-        for cl in cands["left"]:
-            for cr in cands["right"]:
-                conflicts = cl["conflicts"] + cr["conflicts"]
-                clearance = min(cl["clearance"], cr["clearance"])
-                dev = cl["dev"] + cr["dev"]
-                fkey = (len(conflicts), -clearance, dev, cl["shift"], cr["shift"], phase)
-                if fallback is None or fkey < fallback[0]:
-                    fallback = (fkey, cl, cr, conflicts, clearance)
-                if conflicts or clearance < req - 1e-9:
-                    continue
-                key = (-clearance, dev, cl["shift"], cr["shift"], phase)
-                if best is None or key < best[0]:
-                    best = (key, cl, cr, phase, clearance)
-    if best is None:
-        _, cl, cr, conflicts, clearance = fallback
-        if conflicts:
+    per_side = {}
+    for side in ("left", "right"):
+        lac = getattr(spec, side)
+        flange_r = (spec.hub.flange_pcd_left_mm if side == "left"
+                    else spec.hub.flange_pcd_right_mm) / 2.0
+        order, solutions = _side_assignments(layout, side, n_side, lac.cross, rim_r, flange_r)
+        if not solutions:
+            conflicts = _diagnose_side(layout, side, n_side, lac.cross, rim_r, flange_r)
             raise WheelError(
                 "LACING_INFEASIBLE",
-                f"自动穿法无解：{len(conflicts)} 处孔位在实际角度下不满足交叉方向/交叉数设置",
+                f"自动穿法无解：{side} 侧在实际孔位下不存在满足交叉方向/交叉数设置的孔位双射",
                 {
                     "conflicts": conflicts,
+                    "side": side,
                     "cross": {"left": spec.left.cross, "right": spec.right.cross},
                 },
             )
+        evaluated = []
+        for idx, assign in enumerate(solutions):
+            entries, dev = _solution_entries(layout, side, order, assign, lac, lac.cross)
+            clearance = _valve_clearance_mm(spec, layout, entries, v_pt)
+            evaluated.append({
+                "entries": entries, "dev": dev, "clearance": clearance,
+                "assign": assign, "order": order, "idx": idx,
+            })
+        per_side[side] = evaluated
+
+    best = None
+    for cl in per_side["left"]:
+        for cr in per_side["right"]:
+            clearance = min(cl["clearance"], cr["clearance"])
+            key = (-clearance, cl["dev"] + cr["dev"], cl["idx"], cr["idx"])
+            if best is None or key < best[0]:
+                best = (key, cl, cr, clearance)
+    _, cl, cr, clearance = best
+    if clearance < req - 1e-9:
         raise WheelError(
             "LACING_INFEASIBLE",
             f"自动穿法无解：阀孔净空要求 {r3(req)} mm 不可达（最佳 {r3(clearance)} mm）",
@@ -206,10 +422,8 @@ def _search_lacing(spec, layout, n_side: int):
                 "conflicts": _nearest_to_valve(spec, layout, cl["entries"] + cr["entries"], v_pt, rim_r),
             },
         )
-    _, cl, cr, phase, clearance = best
-    entries = cl["entries"] + cr["entries"]
-    shifts = {"left": cl["shift"], "right": cr["shift"]}
-    return entries, clearance, phase, shifts
+    phase, shifts = _derive_phase_shift(cl, cr, layout, n_side, spec)
+    return cl["entries"] + cr["entries"], clearance, phase, shifts
 
 
 def _check_bijection(entries: list[dict], layout, n_side: int) -> None:

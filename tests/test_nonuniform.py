@@ -219,11 +219,10 @@ def test_mapping_override_with_hole_table():
     r = client.post("/plans", json=_paired_spec(mapping_override=override))
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "MAPPING_INVALID"
-    # 圈孔重复占用
+    # 圈孔重复占用（Pydantic 阶段 422）
     override = [{"side": "right", "rim_hole": 0, "hub_hole": 0}] * 2
     r = client.post("/plans", json=_paired_spec(mapping_override=override))
-    assert r.status_code == 400
-    assert r.json()["error"]["code"] == "DUPLICATE_HOLE_MAPPING"
+    assert r.status_code == 422
     # 侧别不符（0 号孔在右侧）
     override = [{"side": "left", "rim_hole": 0, "hub_hole": 0}]
     r = client.post("/plans", json=_paired_spec(mapping_override=override))
@@ -294,3 +293,106 @@ def test_uniform_plan_angle_source_and_angles():
     assert geo["angle_source"]["rim"] == "uniform"
     for h in geo["per_hole"]:
         assert h["rim_angle_deg"] == pytest.approx(360.0 * h["rim_hole"] / 36.0, abs=1e-3)
+
+
+def _spoke_crossings(per_hole, side, rim_r, flange_r):
+    """按快照中的实际角度计算该侧每根辐条与反向辐条的弦交叉次数。"""
+    def orient(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    def cross(p1, p2, p3, p4):
+        d1 = orient(p3, p4, p1)
+        d2 = orient(p3, p4, p2)
+        d3 = orient(p1, p2, p3)
+        d4 = orient(p1, p2, p4)
+        return d1 * d2 < 0 and d3 * d4 < 0
+
+    spokes = []
+    for h in per_hole:
+        if h["side"] != side:
+            continue
+        a = math.radians(h["rim_angle_deg"])
+        g = math.radians(h["hub_angle_deg"])
+        spokes.append((
+            (rim_r * math.cos(a), rim_r * math.sin(a)),
+            (flange_r * math.cos(g), flange_r * math.sin(g)),
+            h["direction"],
+        ))
+    counts = []
+    for i, (p1, p2, d) in enumerate(spokes):
+        cnt = 0
+        for j, (q1, q2, d2) in enumerate(spokes):
+            if i == j or not cross(p1, p2, q1, q2):
+                continue
+            assert d != d2, f"{side} 侧同向辐条 {i}/{j} 相交"
+            cnt += 1
+        counts.append(cnt)
+    return counts
+
+
+def test_12h_nonuniform_noncyclic_solution():
+    """12 孔非等距：合法解不是整体循环移位，自动穿法也必须能找到。
+
+    该布局经暴力枚举验证：全部循环移位候选均不满足实际交叉数约束，
+    但存在非循环的合法孔位双射（右侧）。
+    """
+    table = []
+    for i, a in enumerate([0.0, 82.78, 179.92, 246.91, 285.27, 342.12]):
+        table.append({"id": i, "angle_deg": a, "side": "right", "axial_offset_mm": 1.5})
+    for i, a in enumerate([30.0, 90.0, 150.0, 210.0, 270.0, 330.0]):
+        table.append({"id": 6 + i, "angle_deg": a, "side": "left", "axial_offset_mm": 1.5})
+    spec = {
+        "name": "12h-nonuniform",
+        "rim": {"erd_mm": 600.0, "holes": 12, "valve_position": 0, "hole_table": table},
+        "hub": {
+            "holes_per_flange": 6,
+            "flange_pcd_left_mm": 50.0,
+            "flange_pcd_right_mm": 50.0,
+            "center_to_flange_left_mm": 30.0,
+            "center_to_flange_right_mm": 30.0,
+            "spoke_hole_diameter_mm": 2.4,
+            "flange_angles_right_deg": [0.34, 60.11, 120.02, 180.31, 239.95, 300.26],
+        },
+        "left": {"cross": 1},
+        "right": {"cross": 1},
+        "spoke_diameter_mm": 2.0,
+    }
+    r = client.post("/plans", json=spec)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    lac = body["lacing"]
+    # 右侧解不是整体循环移位（None），左侧等距布局为循环移位 0
+    assert lac["flange_shift"]["right"] is None
+    assert lac["flange_shift"]["left"] == 0
+    # 双射 + 每侧 3 顺 3 逆
+    mapping = lac["mapping"]
+    assert len(mapping) == 12
+    assert len({e["rim_hole"] for e in mapping}) == 12
+    for side in ("left", "right"):
+        hubs = [e["hub_hole"] for e in mapping if e["side"] == side]
+        assert sorted(hubs) == list(range(6))
+        dirs = [e["direction"] for e in mapping if e["side"] == side]
+        assert dirs.count("trailing") == dirs.count("leading") == 3
+    # 实际几何交叉数：每根辐条与反向辐条恰交叉 1 次
+    ph = body["geometry"]["per_hole"]
+    for side in ("left", "right"):
+        assert _spoke_crossings(ph, side, 300.0, 25.0) == [1] * 6
+    # 重复提交搜索结果一致
+    b2 = client.post("/plans", json=spec).json()
+    assert b2["lacing"] == lac
+    assert b2["geometry"] == body["geometry"]
+
+
+def test_failed_create_leaves_no_plan_record():
+    """创建失败（400/422）不得写入方案记录（不留 current_version=0 的空方案）。"""
+    before = [p["plan_id"] for p in client.get("/plans").json()["plans"]]
+    # 阀孔净空无解 -> 400
+    r = client.post("/plans", json=_standard_spec(valve_clearance_min_mm=200.0))
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "LACING_INFEASIBLE"
+    # 圈孔重复占用 -> 422
+    dup = [{"side": "right", "rim_hole": 0, "hub_hole": 0}] * 2
+    r2 = client.post("/plans", json=_standard_spec(mapping_override=dup))
+    assert r2.status_code == 422
+    after = [p["plan_id"] for p in client.get("/plans").json()["plans"]]
+    assert after == before

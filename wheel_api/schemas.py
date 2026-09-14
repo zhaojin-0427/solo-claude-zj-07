@@ -147,6 +147,21 @@ class WheelSpec(BaseModel):
         default=None, description="可选自定义孔位映射；提供时必须覆盖全部圈孔且不得重复"
     )
 
+    @model_validator(mode="after")
+    def _check_mapping_override(self):
+        mo = self.mapping_override
+        if mo is None:
+            return self
+        seen: dict[int, int] = {}
+        for idx, m in enumerate(mo):
+            if m.rim_hole in seen:
+                raise ValueError(
+                    f"圈孔 {m.rim_hole} 被重复占用（第 {seen[m.rim_hole]} 与第 {idx} 条映射），"
+                    f"每个圈孔只能穿一根辐条"
+                )
+            seen[m.rim_hole] = idx
+        return self
+
 
 class InventorySpoke(BaseModel):
     length_mm: float = Field(gt=0)

@@ -51,8 +51,12 @@ def canonical(snapshot: dict) -> str:
     return json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
 
 
+def new_plan_id() -> str:
+    return "whl_" + uuid.uuid4().hex[:12]
+
+
 def create_plan(name: str) -> tuple[str, str]:
-    plan_id = "whl_" + uuid.uuid4().hex[:12]
+    plan_id = new_plan_id()
     created = _now()
     with _conn() as conn:
         conn.execute(
@@ -60,6 +64,21 @@ def create_plan(name: str) -> tuple[str, str]:
             (plan_id, name, created),
         )
     return plan_id, created
+
+
+def insert_plan_with_version(plan_id: str, name: str, version: int, snapshot_text: str) -> str:
+    """原子写入方案与首个版本快照：任一失败则整体不写入（不留空方案）。"""
+    created = _now()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO plans (id, name, created_at, current_version) VALUES (?, ?, ?, ?)",
+            (plan_id, name, created, version),
+        )
+        conn.execute(
+            "INSERT INTO versions (plan_id, version, snapshot, created_at) VALUES (?, ?, ?, ?)",
+            (plan_id, version, snapshot_text, created),
+        )
+    return created
 
 
 def plan_row(plan_id: str):

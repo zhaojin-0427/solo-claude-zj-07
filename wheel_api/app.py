@@ -75,10 +75,11 @@ def health():
 
 @app.post("/plans", status_code=201)
 def create_plan(spec: WheelSpec):
-    plan_id, _ = storage.create_plan(spec.name)
+    # 先完成全部校验与计算，再原子写入方案与版本 1：失败请求不留下空方案
+    plan_id = storage.new_plan_id()
     snapshot = _build_snapshot(spec, plan_id, 1, _now())
     text = storage.canonical(snapshot)
-    storage.insert_version(plan_id, 1, text)
+    storage.insert_plan_with_version(plan_id, spec.name, 1, text)
     return _snapshot_response(text, status_code=201)
 
 
