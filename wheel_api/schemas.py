@@ -188,3 +188,114 @@ class OptimizeSpec(BaseModel):
         if self.min_thread_engagement_mm > self.spoke_thread_length_mm:
             raise ValueError("min_thread_engagement_mm 不能大于 spoke_thread_length_mm")
         return self
+
+
+# ---------------------------------------------------------------------------
+# 调校批次
+# ---------------------------------------------------------------------------
+
+class CalibrationPoint(BaseModel):
+    """张力计校准曲线标定点：读数 -> 实际张力 N（相邻点之间线性插值）。"""
+
+    reading: float = Field(description="张力计读数（表盘分度，按实际仪表单位）")
+    tension_n: float = Field(ge=0.0, description="对应的实际张力 N")
+
+
+class SideTensionLimit(BaseModel):
+    min_n: float = Field(ge=0.0)
+    max_n: float = Field(gt=0.0)
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.max_n <= self.min_n:
+            raise ValueError("max_n 必须大于 min_n")
+        return self
+
+
+class TensionLimitOverride(BaseModel):
+    """左右侧分别的张力窗口（用于碟形轮两侧不同上限）；缺省侧回落全局值。"""
+
+    left: Optional[SideTensionLimit] = None
+    right: Optional[SideTensionLimit] = None
+
+
+class TuningBatchCreate(BaseModel):
+    """创建调校批次：从不可变方案版本取数，本请求只填调校仪器与轮圈影响参数。"""
+
+    name: str = "tuning"
+    calibration_curve: list[CalibrationPoint] = Field(min_length=2, description="张力计校准曲线，读数严格递增")
+    radial_zero_mm: float = Field(description="百分表径向零位读数 mm（测点径向读数减去该值为相对跳动）")
+    lateral_zero_mm: float = Field(description="百分表横向零位读数 mm（正方向取右/驱动侧）")
+    thread_pitch_mm: float = Field(gt=0.0, description="辐条螺纹螺距 mm/圈")
+    rim_influence_radial_mm_per_turn: float = Field(
+        ge=0.0, description="轮圈径向影响系数：一根条帽收紧 1 圈在本孔产生的半径变化 mm（取正值）")
+    rim_influence_lateral_mm_per_turn: float = Field(
+        ge=0.0, description="轮圈横向影响系数：一根条帽收紧 1 圈在本孔产生的横向偏移 mm（右收紧=向右）")
+    tension_transfer: float = Field(
+        default=0.5, gt=0.0, le=1.0,
+        description="张紧传递系数 τ（0,1]：条帽拉入位移中由辐条弹性承担的比例，"
+                    "其余由轮圈弯曲吸收；ΔT=τ·A·E·P/L·u，典型 0.3~0.7")
+    tension_min_n: float = Field(default=0.0, ge=0.0, description="全局张力下限 N")
+    tension_max_n: float = Field(default=1600.0, gt=0.0, description="全局张力上限 N")
+    tension_limits_override: Optional[TensionLimitOverride] = Field(
+        default=None, description="左右侧各自的张力窗口；缺省侧使用全局值")
+    radial_tolerance_mm: float = Field(default=0.3, ge=0.0, description="径向（去偏心后）跳动超限门限 mm")
+    lateral_tolerance_mm: float = Field(default=0.3, ge=0.0, description="横向（去碟形后）跳动超限门限 mm")
+    max_turns_per_spoke: float = Field(
+        default=2.0, gt=0.0, description="一轮内单根辐条累计转动量上限（圈，按 1/8 取整）")
+    step_start_angle_deg: float = Field(
+        default=0.0, ge=0.0, lt=360.0, description="步进编排起始圆周角（度，自该角沿角序、左右交替）")
+
+    @model_validator(mode="after")
+    def _check_batch(self):
+        curve = self.calibration_curve
+        for p0, p1 in zip(curve, curve[1:]):
+            if p1.reading <= p0.reading:
+                raise ValueError(
+                    f"校准曲线读数必须严格递增（{p0.reading} 之后出现 {p1.reading}）")
+            if p1.tension_n + 1e-9 < p0.tension_n:
+                raise ValueError(
+                    f"校准曲线张力必须单调不减（读数 {p0.reading}->{p1.reading}）")
+        if self.tension_max_n <= self.tension_min_n:
+            raise ValueError("tension_max_n 必须大于 tension_min_n")
+        if self.tension_limits_override is not None:
+            for side, lim in (("left", self.tension_limits_override.left),
+                              ("right", self.tension_limits_override.right)):
+                if lim is None:
+                    continue
+        # 1/8 圈整数倍检查
+        units = self.max_turns_per_spoke * 8
+        if abs(units - round(units)) > 1e-6:
+            raise ValueError("max_turns_per_spoke 必须是 1/8 圈的整数倍")
+        return self
+
+
+class SpokeReading(BaseModel):
+    """单根辐条测点：张力计读数 + 百分表径向/横向读数（mm，零位在批次上）。"""
+
+    rim_hole: int = Field(ge=0)
+    gauge_reading: float
+    radial_mm: float
+    lateral_mm: float
+
+
+class MeasurementSubmit(BaseModel):
+    readings: list[SpokeReading] = Field(min_length=1, description="沿圈孔角序提交的全部测点")
+
+
+class LockRequest(BaseModel):
+    lock: list[int] = Field(default_factory=list, description="要求锁定（不得调整）的圈孔号")
+    unlock: list[int] = Field(default_factory=list, description="解除锁定的圈孔号")
+
+    @model_validator(mode="after")
+    def _check(self):
+        if not self.lock and not self.unlock:
+            raise ValueError("lock 与 unlock 至少提供其一")
+        overlap = sorted(set(self.lock) & set(self.unlock))
+        if overlap:
+            raise ValueError(f"同一孔不能同时锁定与解锁: {overlap}")
+        return self
+
+
+class ConfirmRoundRequest(BaseModel):
+    candidate_index: int = Field(default=0, ge=0, description="确认的候选方案编号（0 = 不动作基线）")

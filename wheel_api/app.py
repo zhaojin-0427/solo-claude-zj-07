@@ -1,4 +1,4 @@
-"""FastAPI 应用：方案创建、版本化读取、优化。
+"""FastAPI 应用：方案创建、版本化读取、优化与调校批次。
 
 - POST /plans                          新建方案（版本 1：几何 + 穿法 + SVG）
 - GET  /plans                          列出方案
@@ -6,6 +6,19 @@
 - GET  /plans/{plan_id}/versions/{v}   读取指定版本快照（不可变，重复读取一致）
 - POST /plans/{plan_id}/versions       以新的轮组输入生成新版本
 - POST /plans/{plan_id}/optimize       提交库存/垫圈/张力约束，生成含优化结果的新版本
+
+调校批次（从不可变方案版本取数，状态 collecting -> adjusting -> finalized）：
+- POST /plans/{plan_id}/batches        创建调校批次（校准曲线、零位、螺距、影响系数）
+- GET  /batches                        列出批次（可按 plan_id 过滤）
+- GET  /batches/{batch_id}             读取批次当前状态
+- POST /batches/{batch_id}/measurements 沿圈孔顺序提交整轮张力/径向/横向读数
+- POST /batches/{batch_id}/locks       锁定/解锁辐条（采集中）
+- GET  /batches/{batch_id}/proposals   步进候选方案与逐步预测（排序后）
+- POST /batches/{batch_id}/rounds/confirm   确认候选，冻结该轮测量/动作/结果
+- POST /batches/{batch_id}/rounds/complete  完成本轮，下一轮从快照继续
+- POST /batches/{batch_id}/rounds/cancel    放弃调整，回到采集中
+- POST /batches/{batch_id}/finalize    定稿（保留来源方案版本与完整轨迹）
+- GET  /batches/{batch_id}/trajectory  完整调校轨迹与事件流
 """
 
 from __future__ import annotations
@@ -16,7 +29,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
-from . import geometry, lacing, optimizer, storage, svg
+from . import batches, geometry, lacing, optimizer, storage, svg
 from .errors import WheelError
 from .schemas import OptimizeSpec, WheelSpec
 
@@ -24,9 +37,11 @@ storage.init_db()
 
 app = FastAPI(
     title="Wheel Lacing API",
-    version="1.0.0",
-    description="自行车轮组编轮计算：辐条长度、角度、张力比、穿线图与库存组合优化",
+    version="1.1.0",
+    description="自行车轮组编轮计算：辐条长度、角度、张力比、穿线图、库存组合优化与调校批次",
 )
+
+app.include_router(batches.router)
 
 
 @app.exception_handler(WheelError)

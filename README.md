@@ -26,6 +26,56 @@ python3 -m uvicorn wheel_api.app:app --port 8000
 | POST | `/plans/{plan_id}/versions` | 以新的轮组输入生成新版本 |
 | POST | `/plans/{plan_id}/optimize` | 提交库存/垫圈/张力约束，生成含优化结果的新版本 |
 
+### 调校批次
+
+调校批次从一个**不可变方案版本**取数（默认最新版本，可用查询参数 `?version=N`
+固定），创建时只填写调校仪器与轮圈影响参数；批次状态依次为
+`collecting`（采集中）→ `adjusting`（调整中）→ `finalized`（已定稿）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/plans/{plan_id}/batches` | 创建调校批次（固定来源方案版本） |
+| GET | `/batches` | 列出批次（可按 `?plan_id=` 过滤） |
+| GET | `/batches/{batch_id}` | 读取批次当前状态（测点、各轮、锁定、累计转动） |
+| POST | `/batches/{batch_id}/measurements` | 沿圈孔角序提交整轮张力计与径向/横向读数 |
+| POST | `/batches/{batch_id}/locks` | 锁定/解锁辐条（仅采集中；锁定后不得调整） |
+| GET | `/batches/{batch_id}/proposals` | 步进候选方案与逐步预测（按字典序排序） |
+| POST | `/batches/{batch_id}/rounds/confirm` | 确认候选，冻结本轮测量/动作/结果，进入调整中 |
+| POST | `/batches/{batch_id}/rounds/complete` | 完成本轮，下一轮从该快照继续 |
+| POST | `/batches/{batch_id}/rounds/cancel` | 放弃调整，回到采集中（冻结轮保留在轨迹） |
+| POST | `/batches/{batch_id}/finalize` | 定稿（保留来源方案版本与完整调校轨迹） |
+| GET | `/batches/{batch_id}/trajectory` | 完整调校轨迹与只增事件流 |
+
+创建批次填写：张力计校准曲线（`reading → tension_n`，≥2 点、读数严格递增、
+张力单调不减，相邻点之间线性插值）、百分表径向/横向零位（测点读数减去零位
+为相对跳动）、辐条螺纹螺距、轮圈径向与横向影响系数、张紧传递系数 τ、
+全局/左右侧张力上下限、径向/横向超限门限与单孔每轮转动上限。
+
+每轮沿**圈孔角序**提交全部辐条的 `(gauge_reading, radial_mm, lateral_mm)`，
+允许从任意孔起步（循环移位）但不得逆序。服务端换算实际张力，并结合快照中的
+孔位映射与实际角度计算：偏心（径向一阶谐波，幅值与偏心角）、碟形偏移
+（横向加权均值，正=偏右/驱动侧）、左右侧张力均值与**局部张力离散度**
+（同侧角序 5 孔循环滑动窗标准差）。缺测、孔号重复、顺序错误、读数越出校准
+范围、孔号不属于来源方案，均返回具体测点（孔号/序号）；已定稿批次追加任何
+数据一律拒绝。
+
+`GET /proposals` 返回候选列表：候选 0 恒为**不动作基线**（可直接确认以只
+冻结测量），其余候选按 **超限测点数 → 最大跳动 → 局部张力离散度 → 总转动量**
+字典序升序排列，且必须严格优于基线才输出。每个候选给出：
+
+- 逐步动作：自起始角沿角序、左右就近配对交错，按"层"铺放
+  （先 1/2 圈、再 1/4、最后 1/8，每孔每层至多一步，避免先把单孔深拧到位），
+  逐步预测执行后的超限量、最大跳动、左右张力与累计转动量；
+- `spoke_actions`：各孔汇总的收紧/拧松圈数与张力前后值；
+- `blocked_spokes`：被锁定（`locked`）或已在张力上/下限（
+  `at_upper_limit_no_tighten` / `at_lower_limit_no_loosen`）而不可调整的孔。
+
+确认一轮后该轮的测量、候选与选中结果、当时的锁定状态全部冻结；下一轮从
+快照继续，累计转动量按孔保留。定稿后的 `trajectory` 记录来源 `plan_id` +
+`version` + 公式版本（方案/调校/校准三个）、逐轮测量指标、动作、逐步预测与
+累计转动量；存储层另有 `batch_events` 只增事件流（创建/采集/候选缓存/
+锁定/确认/完成/取消/定稿），可重放完整调校过程。
+
 ### 输入约定
 
 - **圈孔编号** `0..N-1`，从驱动侧看顺时针递增；偶数孔在右侧，奇数孔在左侧。
@@ -121,6 +171,26 @@ w_eff  = center_to_flange − rim_hole_offset（同侧圈孔横向偏移，逐�
 出线角  = 辐条轮平面投影与法兰孔切线的夹角（0 = 相切，90 = 径向）
 ```
 
+### 调校模型（formula_version: wheel-tuning/1.0）
+
+```
+T       = 张力计校准曲线线性插值（越出标定点范围拒绝）
+ΔL      = u·P（u=条帽转动圈数，P=螺距；收紧 u>0，拧松 u<0）
+ΔT      = τ·A·E·P/L·u  （τ=张紧传递系数，A=πd²/4，E=205900 N/mm²）
+Δr_i    = −k_radial · Σ_j w(θ_i−θ_j)·u_j
+Δz_i    = k_lateral · (右侧 u 取正、左侧 u 取负) · Σ_j w(θ_i−θ_j)·u_j
+w(x)    = (1 + cos(πx/2))/2，x=孔间角/平均节距，|x| ≤ 2（钟形窗）
+偏心    = 径向读数（去恒定半径基线）一阶谐波幅值 hypot(Σwr cosθ, Σwr sinθ)
+碟形偏移 = Σ w_i·z_i（横向读数相对零位，正 = 偏右/驱动侧）
+离散度  = 同侧角序 5 孔循环滑动窗张力标准差（各侧窗均值/最大值）
+候选排序 = 超限测点数 ↑ → 最大跳动 hypot(径残差, 横残差) ↑ → 离散度 ↑ → 总转动量 ↑
+```
+
+τ 表示条帽拉入位移中由辐条弹性承担的比例（其余由轮圈弯曲吸收，
+典型 0.3~0.7）；搜索先以平滑目标引导越门限与多孔协调（碟形/偏心），
+再按上述官方字典序精修，最终只输出严格优于不动作基线的候选。
+
+
 ## 错误返回
 
 领域错误返回 400（未找到为 404），结构为
@@ -137,6 +207,17 @@ w_eff  = center_to_flange − rim_hole_offset（同侧圈孔横向偏移，逐�
 | `MAPPING_INCOMPLETE` | 自定义映射未覆盖全部孔位 |
 | `MAPPING_INVALID` | 自定义映射孔号不存在/越界或圈孔侧别不符 |
 | `GEOMETRY_INVALID` | 几何参数矛盾（如有效偏距 ≤ 0） |
+| `PLAN_NOT_FOUND` / `BATCH_NOT_FOUND` / `VERSION_NOT_FOUND` / `CANDIDATE_NOT_FOUND` | 方案/批次/版本/候选不存在（404 或 400） |
+| `CALIBRATION_INVALID` | 张力计校准曲线点数不足、读数不严格递增或张力非单调 |
+| `MEASUREMENT_MISSING_HOLE` | 缺测，`details.missing_rim_holes` 给出缺测孔号 |
+| `MEASUREMENT_DUPLICATE_HOLE` | 孔号重复，给出孔号与两个测点序号 |
+| `MEASUREMENT_HOLE_UNKNOWN` | 测点孔号不属于来源方案 |
+| `MEASUREMENT_ORDER_INVALID` | 未沿圈孔角序提交，给出序号、孔号与期望的下一孔号 |
+| `MEASUREMENT_OUT_OF_RANGE` | 张力计读数越出校准范围，给出测点与校准范围 |
+| `BATCH_STATUS_INVALID` | 状态机拒绝（如调整中采集/锁定、定稿后追加数据） |
+| `BATCH_NO_MEASUREMENT` | 未采集本轮测量就请求方案/确认 |
+| `BATCH_FINALIZE_EMPTY` | 没有任何已确认调校轮就定稿 |
+| `BATCH_HOLE_UNKNOWN` | 锁定/解锁孔号不属于来源方案 |
 
 孔表覆盖/编号重复、圆周角重复、侧别数量、法兰相位与逐孔角度互斥及覆盖、
 `mapping_override` 圈孔重复占用等输入校验由 Pydantic 完成，返回 422 及具体字段位置。
