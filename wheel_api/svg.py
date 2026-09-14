@@ -1,10 +1,13 @@
-"""SVG 穿线图：左右两个法兰视图，标注圈孔号、法兰孔号、阀孔与首根辐条。"""
+"""SVG 穿线图：左右两个法兰视图，标注圈孔号、法兰孔号、阀孔与首根辐条。
+
+一律按实际孔位角度（Layout）绘制，支持非等距钻孔与自定义法兰相位。
+"""
 
 from __future__ import annotations
 
 import math
 
-from .geometry import hub_angle, rim_angle
+from .geometry import resolve_layout, valve_angle
 
 RIM_PX = 185.0
 PANEL_W = 460.0
@@ -28,9 +31,8 @@ def _pt(cx, cy, radius, ang):
     return cx + radius * math.cos(ang), cy - radius * math.sin(ang)
 
 
-def _panel(spec, entries, geometry, side: str, cx: float, cy: float, first_rim_hole: int) -> str:
-    n_total = spec.rim.holes
-    n_side = n_total // 2
+def _panel(spec, layout, entries, geometry, side: str, cx: float, cy: float, first_rim_hole: int) -> str:
+    n_side = geometry["holes_per_side"]
     rim_r = spec.rim.erd_mm / 2.0
     flange_r = (spec.hub.flange_pcd_right_mm if side == "right" else spec.hub.flange_pcd_left_mm) / 2.0
     hub_px = RIM_PX * flange_r / rim_r
@@ -45,8 +47,8 @@ def _panel(spec, entries, geometry, side: str, cx: float, cy: float, first_rim_h
     for e in entries:
         if e["side"] != side:
             continue
-        a_r = rim_angle(e["rim_hole"], n_total)
-        a_h = hub_angle(side, e["hub_hole"], n_side)
+        a_r = layout.rim_angles[e["rim_hole"]]
+        a_h = layout.hub_angles[side][e["hub_hole"]]
         x1, y1 = _pt(cx, cy, hub_px, a_h)
         x2, y2 = _pt(cx, cy, RIM_PX, a_r)
         color = COLORS[e["direction"]]
@@ -57,11 +59,11 @@ def _panel(spec, entries, geometry, side: str, cx: float, cy: float, first_rim_h
             f'stroke="{color}" stroke-width="{width}" opacity="0.85"{dash}/>'
         )
 
-    # 圈孔与编号
-    for i in range(n_total):
-        a = rim_angle(i, n_total)
+    # 圈孔与编号（按实际角度与侧别归属）
+    for i in layout.rim_order:
+        a = layout.rim_angles[i]
         x, y = _pt(cx, cy, RIM_PX, a)
-        own = (i % 2 == 0) == (side == "right")
+        own = layout.rim_sides[i] == side
         fill = COLORS["text"] if own else COLORS["hole"]
         parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.4" fill="{fill}"/>')
         lx, ly = _pt(cx, cy, RIM_PX + 13, a)
@@ -69,14 +71,14 @@ def _panel(spec, entries, geometry, side: str, cx: float, cy: float, first_rim_h
 
     # 法兰孔与编号
     for j in range(n_side):
-        a = hub_angle(side, j, n_side)
+        a = layout.hub_angles[side][j]
         x, y = _pt(cx, cy, hub_px, a)
         parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2" fill="{COLORS["hub"]}"/>')
         lx, ly = _pt(cx, cy, max(hub_px - 11, 8), a)
         parts.append(f'<text x="{lx:.1f}" y="{ly:.1f}" class="hubnum" text-anchor="middle" dominant-baseline="middle">{j}</text>')
 
     # 阀孔
-    v_ang = (spec.rim.valve_position + 0.5) * 2.0 * math.pi / n_total
+    v_ang = valve_angle(layout, spec.rim.valve_position)
     vx, vy = _pt(cx, cy, RIM_PX, v_ang)
     parts.append(f'<circle cx="{vx:.1f}" cy="{vy:.1f}" r="5" fill="none" stroke="{COLORS["valve"]}" stroke-width="2"/>')
     lx, ly = _pt(cx, cy, RIM_PX + 26, v_ang)
@@ -84,7 +86,7 @@ def _panel(spec, entries, geometry, side: str, cx: float, cy: float, first_rim_h
 
     # 首根辐条标记（紧邻阀孔的圈孔，仅在其所属面板）
     if any(e["rim_hole"] == first_rim_hole for e in entries):
-        a0 = rim_angle(first_rim_hole, n_total)
+        a0 = layout.rim_angles[first_rim_hole]
         fx, fy = _pt(cx, cy, RIM_PX - 14, a0)
         parts.append(f'<circle cx="{fx:.1f}" cy="{fy:.1f}" r="4" fill="{COLORS["first"]}"/>')
 
@@ -94,7 +96,9 @@ def _panel(spec, entries, geometry, side: str, cx: float, cy: float, first_rim_h
     return "\n".join(parts)
 
 
-def render_svg(spec, entries: list[dict], geometry: dict, first_rim_hole: int = 0) -> str:
+def render_svg(spec, entries: list[dict], geometry: dict, first_rim_hole: int = 0, layout=None) -> str:
+    if layout is None:
+        layout = resolve_layout(spec)
     width = PANEL_W * 2
     cx1, cx2, cy = PANEL_W / 2, PANEL_W * 1.5, HEIGHT / 2 + 10
     left_entries = [e for e in entries if e["side"] == "left"]
@@ -110,8 +114,8 @@ def render_svg(spec, entries: list[dict], geometry: dict, first_rim_hole: int = 
   .legend {{ font-size: 10px; }}
 </style>
 <rect width="100%" height="100%" fill="white"/>
-{_panel(spec, right_entries, geometry, "right", cx1, cy, first_rim_hole)}
-{_panel(spec, left_entries, geometry, "left", cx2, cy, first_rim_hole)}
+{_panel(spec, layout, right_entries, geometry, "right", cx1, cy, first_rim_hole)}
+{_panel(spec, layout, left_entries, geometry, "left", cx2, cy, first_rim_hole)}
 <g class="legend">
   <line x1="20" y1="{legend_y}" x2="50" y2="{legend_y}" stroke="{COLORS["trailing"]}" stroke-width="2"/>
   <text x="56" y="{legend_y + 3}">trailing</text>
