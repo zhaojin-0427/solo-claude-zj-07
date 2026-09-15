@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -301,3 +301,161 @@ class ConfirmRoundRequest(BaseModel):
     candidate_index: Optional[int] = Field(
         default=None, ge=0,
         description="确认的候选在候选列表中的位置编号；省略时始终确认 no_action（不动作）候选")
+
+
+# ---------------------------------------------------------------------------
+# 服役载荷校核单
+# ---------------------------------------------------------------------------
+
+class BatchTensionSource(BaseModel):
+    """来源 1：已定稿调校批次，取最后一轮逐孔实测张力。"""
+
+    type: Literal["finalized_batch"] = "finalized_batch"
+    batch_id: str = Field(min_length=1, description="已定稿调校批次 id（trn_…），须与校核单同一方案版本")
+
+
+class UniformTensionSource(BaseModel):
+    """来源 2：左右侧统一名义预张力 N（如设计/厂家推荐值）。"""
+
+    type: Literal["uniform"] = "uniform"
+    left_n: float = Field(gt=0.0, description="左侧各孔预张力 N")
+    right_n: float = Field(gt=0.0, description="右侧各孔预张力 N")
+
+
+TensionSource = Annotated[
+    Union[BatchTensionSource, UniformTensionSource],
+    Field(discriminator="type", description="逐条实测张力来源：已定稿批次或左右侧统一名义值"),
+]
+
+
+class AngleSweep(BaseModel):
+    """轮上角度范围与步长（度，从驱动侧看顺时针递增；0° 为 0 号孔方向）。"""
+
+    start_deg: float = Field(default=0.0, ge=0.0, lt=360.0, description="起始角（度）")
+    end_deg: float = Field(
+        description="终止角（度）；end=start+360 覆盖整圈，扫描角度含端点")
+    step_deg: float = Field(gt=0.0, le=90.0, description="角度步长（度，必须为正）")
+
+    @model_validator(mode="after")
+    def _check_coverage(self):
+        if self.end_deg < self.start_deg:
+            raise ValueError(
+                f"end_deg（{self.end_deg}）不得小于 start_deg（{self.start_deg}）；"
+                "需要跨过 0° 时用 end = start + 360 表示整圈覆盖")
+        span = self.end_deg - self.start_deg
+        if span <= 0.0 or span > 360.0:
+            raise ValueError(f"角度覆盖范围须在 (0, 360] 度之间（当前 {span}°）")
+        steps = span / self.step_deg
+        if abs(steps - round(steps)) > 1e-6:
+            raise ValueError(
+                f"角度范围 {span}° 必须是步长 {self.step_deg}° 的整数倍"
+                f"（{span}/{self.step_deg}={steps:.6g}），保证端点被覆盖")
+        if round(steps) < 1:
+            raise ValueError("角度范围至少包含一个步长（起止两个角度）")
+        return self
+
+    def angles(self) -> list[float]:
+        n = round((self.end_deg - self.start_deg) / self.step_deg)
+        return [self.start_deg + i * self.step_deg for i in range(n + 1)]
+
+
+class ServiceLoads(BaseModel):
+    """轮毂载荷（单位随字段）；载荷系数统一乘到三个载荷上后求解。"""
+
+    radial_n: float = Field(default=0.0, ge=0.0, le=20_000.0, description="轮毂径向载荷 N（沿扫描角方向，典型 2~3 倍体重）")
+    lateral_n: float = Field(default=0.0, ge=-5_000.0, le=5_000.0,
+                             description="轮毂侧向载荷 N（正=右/驱动侧，可为负）")
+    torque_nm: float = Field(default=0.0, ge=0.0, le=3_000.0,
+                             description="驱动或制动扭矩 N·m（大小；方向由 torque_direction 指定）")
+    torque_direction: Literal["drive", "brake"] = Field(
+        default="drive", description="扭矩方向：drive 驱动 / brake 制动（符号相反）")
+    load_factor: float = Field(
+        default=1.0, gt=0.0, le=10.0,
+        description="载荷系数（动载/冲击放大），统一乘到径向、侧向与扭矩")
+
+
+class PretensionSearchSpec(BaseModel):
+    """预张力方案搜索：锁定不调整的辐条，在允许调节范围内搜索。"""
+
+    locked_rim_holes: list[int] = Field(default_factory=list, description="锁定（不得调整）的圈孔号")
+    max_adjustment_n: float = Field(
+        default=300.0, gt=0.0, le=5_000.0,
+        description="单孔相对来源预张力的最大调节量 N（双向，且结果不越服役张力窗口）")
+    step_n: float = Field(
+        default=25.0, gt=0.0, le=500.0,
+        description="单步预张力调节粒度 N；各孔最终调节量须为其整数倍")
+    limit: int = Field(default=10, ge=1, le=50, description="返回方案数上限")
+    selected_index: Optional[int] = Field(
+        default=None, ge=0,
+        description="采用搜索结果时选定的方案编号；缺省采用排序第 0 的方案（仅影响记录，不改写来源）")
+
+    @model_validator(mode="after")
+    def _check_step(self):
+        units = self.max_adjustment_n / self.step_n
+        if abs(units - round(units)) > 1e-6:
+            raise ValueError(
+                f"max_adjustment_n（{self.max_adjustment_n}）须为 step_n（{self.step_n}）的整数倍")
+        if len(self.locked_rim_holes) != len(set(self.locked_rim_holes)):
+            raise ValueError("locked_rim_holes 中的圈孔号不得重复")
+        return self
+
+
+class LoadSheetCreate(BaseModel):
+    """创建服役载荷校核单（草拟）：绑定不可变轮组版本，工况一次填全。"""
+
+    name: str = "service-load"
+    tension_source: TensionSource
+    sweep: AngleSweep
+    loads: ServiceLoads
+    tension_min_n: float = Field(ge=0.0, description="服役张力下限 N（低于即记为低于下限；可填 0，物理失张以张力 ≤ 0 单独判定）")
+    tension_max_n: float = Field(gt=0.0, description="服役张力上限 N（超过即记为超载；物理失张以 0 N 判定）")
+    tension_limits_override: Optional[TensionLimitOverride] = Field(
+        default=None, description="左右侧各自的服役张力窗口；缺省侧使用全局值")
+    residual_tolerance: float = Field(
+        default=1e-6, gt=0.0, le=1e-2,
+        description="平衡残差相对门限：残余合力/总张力（力矩除以轮半径），超过即判该工况无解")
+    pretension_search: Optional[PretensionSearchSpec] = Field(
+        default=None, description="提供则在来源预张力之外搜索并返回可采用的预张力方案")
+
+    @model_validator(mode="after")
+    def _check_window(self):
+        if self.tension_max_n <= self.tension_min_n:
+            raise ValueError("tension_max_n 必须大于 tension_min_n")
+        ov = self.tension_limits_override
+        for side, lim in (("left", ov.left if ov else None),
+                          ("right", ov.right if ov else None)):
+            if lim is not None and lim.max_n <= lim.min_n:
+                raise ValueError(f"{side} 侧 max_n 必须大于 min_n")
+        return self
+
+
+class LoadSheetRevision(BaseModel):
+    """以同一轮组版本生成校核单修订版（草拟）：工况/来源可改，重新计算。"""
+
+    name: Optional[str] = None
+    tension_source: Optional[TensionSource] = None
+    sweep: Optional[AngleSweep] = None
+    loads: Optional[ServiceLoads] = None
+    tension_min_n: Optional[float] = Field(default=None, gt=0.0)
+    tension_max_n: Optional[float] = Field(default=None, gt=0.0)
+    tension_limits_override: Optional[TensionLimitOverride] = None
+    residual_tolerance: Optional[float] = Field(default=None, gt=0.0, le=1e-2)
+    pretension_search: Optional[PretensionSearchSpec] = None
+
+    @model_validator(mode="after")
+    def _check_window(self):
+        lo, hi = self.tension_min_n, self.tension_max_n
+        if lo is not None and hi is not None and hi <= lo:
+            raise ValueError("tension_max_n 必须大于 tension_min_n")
+        ov = self.tension_limits_override
+        for side, lim in (("left", ov.left if ov else None),
+                          ("right", ov.right if ov else None)):
+            if lim is not None and lim.max_n <= lim.min_n:
+                raise ValueError(f"{side} 侧 max_n 必须大于 min_n")
+        return self
+
+
+class AdoptRequest(BaseModel):
+    """采用校核单：可改用搜索结果中的另一个方案编号；缺省沿用创建时的选定。"""
+
+    selected_index: Optional[int] = Field(default=None, ge=0)

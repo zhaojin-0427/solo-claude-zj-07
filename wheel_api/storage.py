@@ -45,6 +45,16 @@ CREATE TABLE IF NOT EXISTS batch_events (
     PRIMARY KEY (batch_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_batches_plan ON batches (plan_id);
+CREATE TABLE IF NOT EXISTS load_sheets (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    plan_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    doc TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_load_sheets_plan ON load_sheets (plan_id);
 """
 
 
@@ -260,3 +270,70 @@ def get_batch_event(batch_id: str, seq: int):
         return None
     return {"seq": row[0], "kind": row[1], "snapshot": json.loads(row[2]),
             "created_at": row[3]}
+
+
+# ---------------------------------------------------------------------------
+# 服役载荷校核单：草稿可改、采用后冻结（status: draft -> adopted）
+# ---------------------------------------------------------------------------
+
+def new_load_sheet_id() -> str:
+    return "lod_" + uuid.uuid4().hex[:12]
+
+
+def insert_load_sheet(sheet_id: str, plan_id: str, plan_version: int,
+                      doc: dict) -> str:
+    created = _now()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO load_sheets (id, plan_id, plan_version, status, doc,"
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sheet_id, plan_id, plan_version, doc["status"], canonical(doc),
+             created, created),
+        )
+    return created
+
+
+def load_sheet_row(sheet_id: str):
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT id, plan_id, plan_version, status, doc, created_at, updated_at"
+            " FROM load_sheets WHERE id = ?",
+            (sheet_id,),
+        ).fetchone()
+
+
+def list_load_sheets(plan_id: str | None = None) -> list[dict]:
+    with _conn() as conn:
+        if plan_id is None:
+            rows = conn.execute(
+                "SELECT id, plan_id, plan_version, status, created_at, updated_at"
+                " FROM load_sheets ORDER BY created_at"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, plan_id, plan_version, status, created_at, updated_at"
+                " FROM load_sheets WHERE plan_id = ? ORDER BY created_at",
+                (plan_id,),
+            ).fetchall()
+    return [
+        {"load_sheet_id": r[0], "plan_id": r[1], "plan_version": r[2],
+         "status": r[3], "created_at": r[4], "updated_at": r[5]}
+        for r in rows
+    ]
+
+
+def save_load_sheet(sheet_id: str, doc: dict, status: str | None = None) -> str:
+    updated = _now()
+    new_status = doc["status"] if status is None else status
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE load_sheets SET doc = ?, status = ?, updated_at = ?"
+            " WHERE id = ?",
+            (canonical(doc), new_status, updated, sheet_id),
+        )
+    return updated
+
+
+def delete_load_sheet(sheet_id: str) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM load_sheets WHERE id = ?", (sheet_id,))

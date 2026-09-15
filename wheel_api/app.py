@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
-from . import batches, geometry, lacing, optimizer, storage, svg
+from . import batches, geometry, lacing, load_sheets, optimizer, storage, svg
 from .errors import WheelError
 from .schemas import OptimizeSpec, WheelSpec
 
@@ -37,11 +37,12 @@ storage.init_db()
 
 app = FastAPI(
     title="Wheel Lacing API",
-    version="1.1.0",
-    description="自行车轮组编轮计算：辐条长度、角度、张力比、穿线图、库存组合优化与调校批次",
+    version="1.2.0",
+    description="自行车轮组编轮计算：辐条长度、角度、张力比、穿线图、库存组合优化、调校批次与服役载荷校核",
 )
 
 app.include_router(batches.router)
+app.include_router(load_sheets.router)
 
 
 @app.exception_handler(WheelError)
