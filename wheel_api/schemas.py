@@ -298,4 +298,6 @@ class LockRequest(BaseModel):
 
 
 class ConfirmRoundRequest(BaseModel):
-    candidate_index: int = Field(default=0, ge=0, description="确认的候选方案编号（0 = 不动作基线）")
+    candidate_index: Optional[int] = Field(
+        default=None, ge=0,
+        description="确认的候选在候选列表中的位置编号；省略时始终确认 no_action（不动作）候选")

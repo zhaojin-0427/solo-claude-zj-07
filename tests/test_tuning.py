@@ -350,28 +350,46 @@ def test_lock_unknown_hole(plan_id, batch):
     assert r.status_code == 400 and r.json()["error"]["code"] == "BATCH_HOLE_UNKNOWN"
 
 
-def test_spokes_at_tension_limit_are_fully_excluded(plan_id):
-    # 初始张力 900、上限设 900：所有孔均已达上限，达限孔两个方向都不调整，
-    # 只剩不动作候选；blocked_spokes 以 at_tension_limit 标记全部 36 根。
+def test_spokes_at_upper_limit_are_fully_excluded(plan_id):
+    # 初始张力 900、上限设 900：所有孔均已达**上限**，两个方向都不调整，
+    # 只剩不动作候选；blocked_spokes 以 at_upper_tension_limit 标记全部 36 根。
     bid = client.post(f"/plans/{plan_id}/batches?version=1",
                       json={**BATCH, "tension_max_n": 900.0}).json()["batch"]["batch_id"]
     holes = _holes(bid)
     cands = _proposals(bid, _readings(holes, lateral=0.5))
     assert [c["label"] for c in cands] == ["no_action"]
     blocked = {b["rim_hole"] for b in cands[0]["blocked_spokes"]
-               if "at_tension_limit" in b["reasons"]}
+               if "at_upper_tension_limit" in b["reasons"]}
     assert blocked == set(holes)
     assert cands[0]["spoke_actions"] == []
-    # 锁定原因与达限原因可同时出现
+    # 锁定原因与达上限原因可同时出现
     bid2 = client.post(f"/plans/{plan_id}/batches?version=1",
                        json={**BATCH, "tension_max_n": 900.0}).json()["batch"]["batch_id"]
     client.post(f"/batches/{bid2}/locks", json={"lock": [holes[0]]})
     cands2 = _proposals(bid2, _readings(holes, lateral=0.5))
     b0 = next(b for b in cands2[0]["blocked_spokes"] if b["rim_hole"] == holes[0])
-    assert b0["reasons"] == ["locked", "at_tension_limit"]
+    assert b0["reasons"] == ["locked", "at_upper_tension_limit"]
 
 
-def test_at_limit_spoke_gets_no_action_even_loosen(plan_id, batch):
+def test_lower_limit_spoke_can_tighten_not_loosen(plan_id):
+    # 初始张力 900、下限设 900：下限孔允许收紧（纠正横向跳动），禁止拧松。
+    bid = client.post(f"/plans/{plan_id}/batches?version=1",
+                      json={**BATCH, "tension_min_n": 900.0}).json()["batch"]["batch_id"]
+    holes = _holes(bid)
+    cands = _proposals(bid, _readings(holes, lateral=0.5))
+    no_action = cands[_no_action_index(cands)]
+    blocked = {b["rim_hole"] for b in no_action["blocked_spokes"]
+               if "at_lower_tension_limit_no_loosen" in b["reasons"]}
+    assert blocked == set(holes)
+    # 存在收紧类动作候选，且所有动作均为收紧、张力不跌破下限
+    action_cands = [c for c in cands if c["label"] != "no_action"]
+    assert action_cands and any(c["spoke_actions"] for c in action_cands)
+    for cand in action_cands:
+        assert all(a["direction"] == "tighten" for a in cand["spoke_actions"])
+        assert all(a["tension_after_n"] >= 900.0 - 1e-6 for a in cand["spoke_actions"])
+
+
+def test_upper_limit_spoke_gets_no_action_even_loosen(plan_id, batch):
     # 只有一根孔因初始高读数达到上限：任何候选都不得对其收紧或拧松
     bid = batch["batch_id"]
     holes = _holes(bid)
@@ -381,7 +399,7 @@ def test_at_limit_spoke_gets_no_action_even_loosen(plan_id, batch):
     for cand in cands:
         assert holes[0] not in [a["rim_hole"] for a in cand["spoke_actions"]]
         if cand["label"] != "no_action":
-            assert any(b["rim_hole"] == holes[0] and "at_tension_limit" in b["reasons"]
+            assert any(b["rim_hole"] == holes[0] and "at_upper_tension_limit" in b["reasons"]
                        for b in cand["blocked_spokes"])
 
 
@@ -470,6 +488,29 @@ def test_confirm_bad_candidate_index(plan_id, batch):
     _proposals(bid, _readings(holes, lateral=0.5))
     r = client.post(f"/batches/{bid}/rounds/confirm", json={"candidate_index": 99})
     assert r.status_code == 400 and r.json()["error"]["code"] == "CANDIDATE_NOT_FOUND"
+
+
+def test_confirm_without_index_selects_no_action(plan_id, batch):
+    # 省略 candidate_index：无论 no_action 在统一排序中的位置，都选中它
+    bid = batch["batch_id"]
+    holes = _holes(bid)
+    cands = _proposals(bid, _readings(holes, lateral=0.5))
+    no_action_pos = _no_action_index(cands)
+    assert no_action_pos != 0  # 碟形场景下有动作方案排在 no_action 之前
+    # 省略字段（空 body）
+    r = client.post(f"/batches/{bid}/rounds/confirm", json={})
+    assert r.status_code == 201, r.text
+    fr = r.json()["round"]
+    assert fr["candidate"]["label"] == "no_action"
+    assert fr["selected_candidate_index"] == no_action_pos
+    assert fr["candidate"]["spoke_actions"] == []
+    # 显式传位置 0 仍按列表位置确认（选中排序首位的有动作候选）
+    client.post(f"/batches/{bid}/rounds/cancel")
+    cands2 = _proposals(bid, _readings(holes, lateral=0.5))
+    r2 = client.post(f"/batches/{bid}/rounds/confirm", json={"candidate_index": 0})
+    assert r2.status_code == 201
+    assert r2.json()["round"]["candidate"]["label"] == cands2[0]["label"]
+    assert r2.json()["round"]["candidate"]["label"] != "no_action"
 
 
 def test_cancel_round(plan_id, batch):
@@ -565,17 +606,42 @@ def test_per_side_tension_override(plan_id, batch):
     cands = _proposals(bid, _readings(holes, lateral=0.5))
     no_action = cands[_no_action_index(cands)]
     left_flagged = {b["rim_hole"] for b in no_action["blocked_spokes"]
-                    if spokes[b["rim_hole"]] == "left" and "at_tension_limit" in b["reasons"]}
+                    if spokes[b["rim_hole"]] == "left"
+                    and "at_upper_tension_limit" in b["reasons"]}
     right_flagged = {b["rim_hole"] for b in no_action["blocked_spokes"]
-                     if spokes[b["rim_hole"]] == "right" and "at_tension_limit" in b["reasons"]}
+                     if spokes[b["rim_hole"]] == "right"
+                     and "at_upper_tension_limit" in b["reasons"]}
     assert len(right_flagged) == 18 and left_flagged == set()
-    # 任何动作候选都不调整右孔（即便拧松也不行）
+    # 右孔达上限：任何候选都不调整右孔（收紧、拧松均不允许）
     for cand in cands:
         if cand["label"] == "no_action":
             continue
         acted_right = {a["rim_hole"] for a in cand["spoke_actions"]
                        if a["side"] == "right"}
         assert acted_right == set()
+
+
+def test_per_side_lower_override_allows_tightening(plan_id, batch):
+    # 左侧下限 900（初始 900 即达下限）：左孔允许收紧、禁止拧松；右侧不受限。
+    body = {**BATCH, "tension_limits_override": {"left": {"min_n": 900, "max_n": 1400}}}
+    bid = client.post(f"/plans/{plan_id}/batches?version=1", json=body).json()["batch"]["batch_id"]
+    holes = _holes(bid)
+    spokes = {s["rim_hole"]: s["side"]
+              for s in client.get(f"/batches/{bid}").json()["batch"]["spokes"]}
+    cands = _proposals(bid, _readings(holes, lateral=0.5))
+    no_action = cands[_no_action_index(cands)]
+    left_flagged = {b["rim_hole"] for b in no_action["blocked_spokes"]
+                    if spokes[b["rim_hole"]] == "left"
+                    and "at_lower_tension_limit_no_loosen" in b["reasons"]}
+    assert len(left_flagged) == 18
+    # 左孔在动作候选中只能收紧
+    for cand in cands:
+        if cand["label"] == "no_action":
+            continue
+        for a in cand["spoke_actions"]:
+            if a["side"] == "left":
+                assert a["direction"] == "tighten"
+                assert a["tension_after_n"] >= 900.0 - 1e-6
 
 
 def test_cumulative_turns_accumulate_across_rounds(plan_id, batch):

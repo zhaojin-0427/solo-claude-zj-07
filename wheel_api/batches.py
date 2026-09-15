@@ -336,13 +336,28 @@ def confirm_round(batch_id: str, req: ConfirmRoundRequest):
     candidates = state["draft"].get("candidates")
     if candidates is None:
         candidates = _proposals_for(state)
-    if req.candidate_index >= len(candidates):
-        raise WheelError(
-            "CANDIDATE_NOT_FOUND",
-            f"候选编号 {req.candidate_index} 不存在（本轮共 {len(candidates)} 个候选 0..{len(candidates) - 1}）",
-            {"candidate_index": req.candidate_index, "candidate_count": len(candidates)},
-        )
-    chosen = candidates[req.candidate_index]
+    # 省略 candidate_index：始终确认 no_action（不论它在统一排序中的位置）；
+    # 显式给索引：按候选列表中的位置确认。
+    if req.candidate_index is None:
+        matches = [i for i, c in enumerate(candidates) if c["label"] == "no_action"]
+        if not matches:
+            raise WheelError(
+                "CANDIDATE_NOT_FOUND",
+                "候选列表中缺少 no_action（不动作）候选",
+                {"candidate_index": None, "candidate_count": len(candidates)},
+            )
+        selected_index = matches[0]
+    else:
+        if req.candidate_index >= len(candidates):
+            raise WheelError(
+                "CANDIDATE_NOT_FOUND",
+                f"候选编号 {req.candidate_index} 不存在"
+                f"（本轮共 {len(candidates)} 个候选 0..{len(candidates) - 1}）",
+                {"candidate_index": req.candidate_index,
+                 "candidate_count": len(candidates)},
+            )
+        selected_index = req.candidate_index
+    chosen = candidates[selected_index]
     round_no = len(state["rounds"]) + 1
 
     # 累计转动量（供下一轮起点与定稿轨迹）
@@ -356,7 +371,7 @@ def confirm_round(batch_id: str, req: ConfirmRoundRequest):
         "round": round_no,
         "confirmed_at": _now(),
         "measurement": state["draft"]["analysis"],
-        "selected_candidate_index": req.candidate_index,
+        "selected_candidate_index": selected_index,
         "candidate": chosen,
         "candidates": candidates,
         "locks_at_confirm": {h: v["side"] for h, v in state["locks"].items()},
